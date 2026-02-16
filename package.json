@@ -1,0 +1,29 @@
+{
+  "name": "stellar-game-studio",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "setup": "bun run scripts/setup.ts",
+    "build": "bun run scripts/build.ts",
+    "deploy": "bun run scripts/deploy.ts",
+    "bindings": "bun run scripts/bindings.ts",
+    "prover:init": "bun run scripts/noir-verifier.ts init",
+    "prover:set": "bun run scripts/noir-verifier.ts set",
+    "prover:clear": "bun run scripts/noir-verifier.ts clear",
+    "prover:set-zk": "bun run scripts/noir-verifier.ts set-zk",
+    "prover:clear-zk": "bun run scripts/noir-verifier.ts clear-zk",
+    "prover:set-bet-token": "bun run scripts/noir-verifier.ts set-bet-token",
+    "prover:clear-bet-token": "bun run scripts/noir-verifier.ts clear-bet-token",
+    "prover:set-fee": "bun run scripts/noir-verifier.ts set-fee",
+    "prover:dev": "bun run scripts/noir-prover.ts",
+    "zk:up": "bun run scripts/zk-up.ts",
+    "dev": "bun --cwd=battleship-frontend run dev",
+    "dev:game": "bun run scripts/dev-game.ts battleship"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "dependencies": {
+    "@stellar/stellar-sdk": "^14.5.0"
+  }
+}

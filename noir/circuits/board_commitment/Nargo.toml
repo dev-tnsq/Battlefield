@@ -1,0 +1,7 @@
+[package]
+name = "board_commitment"
+type = "bin"
+authors = [""]
+compiler_version = ">=0.35.0"
+
+[dependencies]
