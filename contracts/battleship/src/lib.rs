@@ -256,7 +256,7 @@ impl BattleshipContract {
   }
 
   pub fn attack(env: Env, session_id: u32, attacker: Address, x: u32, y: u32) -> Result<(), Error> {
-    require_player_or_session_auth(&env, session_id, &attacker)?;
+    attacker.require_auth();
     let key = DataKey::Game(session_id);
     let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
 
@@ -295,7 +295,7 @@ impl BattleshipContract {
     zk_proof_hash: BytesN<32>,
     zk_proof_signature: Option<BytesN<64>>,
   ) -> Result<(), Error> {
-    require_player_or_session_auth(&env, session_id, &defender)?;
+    defender.require_auth();
     let key = DataKey::Game(session_id);
     let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
 
@@ -347,7 +347,147 @@ impl BattleshipContract {
     defender: Address,
     zk_attack_proof: Bytes,
   ) -> Result<(), Error> {
-    require_player_or_session_auth(&env, session_id, &defender)?;
+    defender.require_auth();
+
+    let key = DataKey::Game(session_id);
+    let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
+    if game.winner.is_some() { return Err(Error::GameAlreadyEnded); }
+
+    let pending_defender = game.pending_defender.clone().ok_or(Error::NoPendingAttack)?;
+    let pending_x = game.pending_x.ok_or(Error::NoPendingAttack)?;
+    let pending_y = game.pending_y.ok_or(Error::NoPendingAttack)?;
+    if pending_defender != defender { return Err(Error::NotPendingDefender); }
+
+    let verifier_addr: Address = env
+      .storage()
+      .instance()
+      .get(&DataKey::ZkVerifierContract)
+      .ok_or(Error::ZkVerifierNotConfigured)?;
+
+    let target_index = pending_y.saturating_mul(game.board_size).saturating_add(pending_x);
+    let board = if defender == game.player1 {
+      game.player1_board.clone().ok_or(Error::BoardsNotReady)?
+    } else if defender == game.player2 {
+      game.player2_board.clone().ok_or(Error::BoardsNotReady)?
+    } else {
+      return Err(Error::NotPlayer);
+    };
+    let expected = board.get(target_index).ok_or(Error::InvalidCoordinate)?;
+
+    let verifier = ZkVerifierClient::new(&env, &verifier_addr);
+    let is_ship = verifier.verify_attack(&session_id, &pending_x, &pending_y, &expected, &zk_attack_proof);
+
+    apply_resolved_attack(&env, session_id, &mut game, target_index, is_ship)?;
+
+    env.storage().temporary().set(&key, &game);
+    extend_game_ttl(&env, &key);
+    Ok(())
+  }
+
+  pub fn attack_by_session(
+    env: Env,
+    session_id: u32,
+    attacker: Address,
+    delegate: Address,
+    x: u32,
+    y: u32,
+  ) -> Result<(), Error> {
+    consume_session_authorization(&env, session_id, &attacker, &delegate)?;
+
+    let key = DataKey::Game(session_id);
+    let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
+
+    if game.winner.is_some() { return Err(Error::GameAlreadyEnded); }
+    if is_wager_game(&game) && !(game.player1_deposited && game.player2_deposited) {
+      return Err(Error::StakesNotFunded);
+    }
+    if x >= game.board_size || y >= game.board_size { return Err(Error::InvalidCoordinate); }
+    if game.player1_board.is_none() || game.player2_board.is_none() { return Err(Error::BoardsNotReady); }
+    if game.pending_attacker.is_some() { return Err(Error::PendingAttackResolution); }
+
+    let turn = game.turn.clone().ok_or(Error::BoardsNotReady)?;
+    if attacker != turn { return Err(Error::NotYourTurn); }
+
+    let target_index = y.saturating_mul(game.board_size).saturating_add(x);
+    let attacked = if attacker == game.player1 { &game.player1_attacks } else if attacker == game.player2 { &game.player2_attacks } else { return Err(Error::NotPlayer); };
+    if contains_u32(attacked, target_index) { return Err(Error::AlreadyAttacked); }
+
+    let defender = if attacker == game.player1 { game.player2.clone() } else { game.player1.clone() };
+    game.pending_attacker = Some(attacker);
+    game.pending_defender = Some(defender);
+    game.pending_x = Some(x);
+    game.pending_y = Some(y);
+
+    env.storage().temporary().set(&key, &game);
+    extend_game_ttl(&env, &key);
+    Ok(())
+  }
+
+  pub fn resolve_attack_by_session(
+    env: Env,
+    session_id: u32,
+    defender: Address,
+    delegate: Address,
+    is_ship: bool,
+    salt: Bytes,
+    zk_proof_hash: BytesN<32>,
+    zk_proof_signature: Option<BytesN<64>>,
+  ) -> Result<(), Error> {
+    consume_session_authorization(&env, session_id, &defender, &delegate)?;
+
+    let key = DataKey::Game(session_id);
+    let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
+
+    if game.winner.is_some() { return Err(Error::GameAlreadyEnded); }
+
+    let pending_defender = game.pending_defender.clone().ok_or(Error::NoPendingAttack)?;
+    let pending_x = game.pending_x.ok_or(Error::NoPendingAttack)?;
+    let pending_y = game.pending_y.ok_or(Error::NoPendingAttack)?;
+    if pending_defender != defender { return Err(Error::NotPendingDefender); }
+
+    if env.storage().instance().has(&DataKey::ZkVerifierContract) {
+      return Err(Error::ZkProofRequired);
+    }
+
+    let target_index = pending_y.saturating_mul(game.board_size).saturating_add(pending_x);
+    let board = if defender == game.player1 { game.player1_board.clone().ok_or(Error::BoardsNotReady)? } else if defender == game.player2 { game.player2_board.clone().ok_or(Error::BoardsNotReady)? } else { return Err(Error::NotPlayer); };
+    let expected = board.get(target_index).ok_or(Error::InvalidCoordinate)?;
+
+    let mut payload = Bytes::new(&env);
+    payload.push_back(if is_ship { 1 } else { 0 });
+    payload.append(&salt);
+    let computed = env.crypto().keccak256(&payload).to_array();
+    if expected != computed { return Err(Error::InvalidCellReveal); }
+
+    let mut proof_payload = Bytes::new(&env);
+    proof_payload.push_back(if is_ship { 1 } else { 0 });
+    proof_payload.append(&salt);
+    append_u32_be(&mut proof_payload, pending_x);
+    append_u32_be(&mut proof_payload, pending_y);
+    let computed_proof_hash = env.crypto().keccak256(&proof_payload).to_array();
+    if zk_proof_hash != computed_proof_hash { return Err(Error::InvalidProofHash); }
+
+    if let Some(verifier_key) = env.storage().instance().get::<DataKey, BytesN<32>>(&DataKey::VerifierPubKey) {
+      let proof_signature = zk_proof_signature.ok_or(Error::MissingProofSignature)?;
+      let message = build_attack_proof_message(&env, session_id, pending_x, pending_y, is_ship, &zk_proof_hash);
+      env.crypto().ed25519_verify(&verifier_key, &message, &proof_signature);
+    }
+
+    apply_resolved_attack(&env, session_id, &mut game, target_index, is_ship)?;
+
+    env.storage().temporary().set(&key, &game);
+    extend_game_ttl(&env, &key);
+    Ok(())
+  }
+
+  pub fn resolve_attack_zk_by_session(
+    env: Env,
+    session_id: u32,
+    defender: Address,
+    delegate: Address,
+    zk_attack_proof: Bytes,
+  ) -> Result<(), Error> {
+    consume_session_authorization(&env, session_id, &defender, &delegate)?;
 
     let key = DataKey::Game(session_id);
     let mut game: Game = env.storage().temporary().get(&key).ok_or(Error::GameNotFound)?;
@@ -700,17 +840,10 @@ fn extend_session_ttl(env: &Env, key: &DataKey) {
   env.storage().persistent().extend_ttl(key, SESSION_GRANT_TTL_LEDGERS, SESSION_GRANT_TTL_LEDGERS);
 }
 
-fn require_player_or_session_auth(env: &Env, session_id: u32, player: &Address) -> Result<(), Error> {
-  let invoker = env.invoker();
+fn consume_session_authorization(env: &Env, session_id: u32, player: &Address, delegate: &Address) -> Result<(), Error> {
+  delegate.require_auth();
 
-  if invoker == *player {
-    player.require_auth();
-    return Ok(());
-  }
-
-  invoker.require_auth();
-
-  let session_key = DataKey::Session(player.clone(), invoker, session_id);
+  let session_key = DataKey::Session(player.clone(), delegate.clone(), session_id);
   let mut grant: SessionGrant = env.storage().persistent().get(&session_key).ok_or(Error::InvalidSession)?;
 
   if env.ledger().sequence() > grant.expires_ledger {

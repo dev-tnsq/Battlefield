@@ -676,15 +676,27 @@ export class BattleshipService {
     x: number,
     y: number,
     signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
+    delegateAddress?: string,
     authTtlMinutes?: number
   ) {
     const client = this.createSigningClient(attackerAddress, signer);
-    const tx = await client.attack({
-      session_id: sessionId,
-      attacker: attackerAddress,
-      x,
-      y,
-    }, DEFAULT_METHOD_OPTIONS);
+    if (delegateAddress && typeof (client as any).attack_by_session !== 'function') {
+      throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
+    }
+    const tx = delegateAddress
+      ? await (client as any).attack_by_session({
+        session_id: sessionId,
+        attacker: attackerAddress,
+        delegate: delegateAddress,
+        x,
+        y,
+      }, DEFAULT_METHOD_OPTIONS)
+      : await client.attack({
+        session_id: sessionId,
+        attacker: attackerAddress,
+        x,
+        y,
+      }, DEFAULT_METHOD_OPTIONS);
 
     const validUntilLedgerSeq = authTtlMinutes
       ? await calculateValidUntilLedger(RPC_URL, authTtlMinutes)
@@ -706,20 +718,37 @@ export class BattleshipService {
     zkProofHash: Buffer,
     zkProofSignature: Buffer | undefined,
     signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
+    delegateAddress?: string,
     authTtlMinutes?: number
   ) {
     const client = this.createSigningClient(defenderAddress, signer);
-    const tx = await client.resolve_attack(
-      {
-        session_id: sessionId,
-        defender: defenderAddress,
-        is_ship: isShip,
-        salt,
-        zk_proof_hash: zkProofHash,
-        zk_proof_signature: zkProofSignature,
-      },
-      DEFAULT_METHOD_OPTIONS
-    );
+    if (delegateAddress && typeof (client as any).resolve_attack_by_session !== 'function') {
+      throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
+    }
+    const tx = delegateAddress
+      ? await (client as any).resolve_attack_by_session(
+        {
+          session_id: sessionId,
+          defender: defenderAddress,
+          delegate: delegateAddress,
+          is_ship: isShip,
+          salt,
+          zk_proof_hash: zkProofHash,
+          zk_proof_signature: zkProofSignature,
+        },
+        DEFAULT_METHOD_OPTIONS,
+      )
+      : await client.resolve_attack(
+        {
+          session_id: sessionId,
+          defender: defenderAddress,
+          is_ship: isShip,
+          salt,
+          zk_proof_hash: zkProofHash,
+          zk_proof_signature: zkProofSignature,
+        },
+        DEFAULT_METHOD_OPTIONS,
+      );
 
     const validUntilLedgerSeq = authTtlMinutes
       ? await calculateValidUntilLedger(RPC_URL, authTtlMinutes)
@@ -738,17 +767,31 @@ export class BattleshipService {
     defenderAddress: string,
     zkAttackProof: Buffer,
     signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
+    delegateAddress?: string,
     authTtlMinutes?: number
   ) {
     const client = this.createSigningClient(defenderAddress, signer);
-    const tx = await client.resolve_attack_zk(
-      {
-        session_id: sessionId,
-        defender: defenderAddress,
-        zk_attack_proof: zkAttackProof,
-      },
-      DEFAULT_METHOD_OPTIONS
-    );
+    if (delegateAddress && typeof (client as any).resolve_attack_zk_by_session !== 'function') {
+      throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
+    }
+    const tx = delegateAddress
+      ? await (client as any).resolve_attack_zk_by_session(
+        {
+          session_id: sessionId,
+          defender: defenderAddress,
+          delegate: delegateAddress,
+          zk_attack_proof: zkAttackProof,
+        },
+        DEFAULT_METHOD_OPTIONS,
+      )
+      : await client.resolve_attack_zk(
+        {
+          session_id: sessionId,
+          defender: defenderAddress,
+          zk_attack_proof: zkAttackProof,
+        },
+        DEFAULT_METHOD_OPTIONS,
+      );
 
     const validUntilLedgerSeq = authTtlMinutes
       ? await calculateValidUntilLedger(RPC_URL, authTtlMinutes)
@@ -787,6 +830,101 @@ export class BattleshipService {
       validUntilLedgerSeq
     );
     return sentTx.result;
+  }
+
+  async authorizeSession(
+    sessionId: number,
+    playerAddress: string,
+    delegateAddress: string,
+    ttlLedgers: number,
+    usesLeft: number,
+    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
+    authTtlMinutes?: number,
+  ) {
+    const client = this.createSigningClient(playerAddress, signer) as any;
+    if (typeof client.authorize_session !== 'function') {
+      throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
+    }
+
+    const tx = await client.authorize_session(
+      {
+        session_id: sessionId,
+        player: playerAddress,
+        delegate: delegateAddress,
+        ttl_ledgers: ttlLedgers,
+        uses_left: usesLeft,
+      },
+      DEFAULT_METHOD_OPTIONS,
+    );
+
+    const validUntilLedgerSeq = authTtlMinutes
+      ? await calculateValidUntilLedger(RPC_URL, authTtlMinutes)
+      : await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
+
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      validUntilLedgerSeq,
+    );
+
+    return sentTx.result;
+  }
+
+  async revokeSession(
+    sessionId: number,
+    playerAddress: string,
+    delegateAddress: string,
+    signer: Pick<contract.ClientOptions, 'signTransaction' | 'signAuthEntry'>,
+    authTtlMinutes?: number,
+  ) {
+    const client = this.createSigningClient(playerAddress, signer) as any;
+    if (typeof client.revoke_session !== 'function') {
+      throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
+    }
+
+    const tx = await client.revoke_session(
+      {
+        session_id: sessionId,
+        player: playerAddress,
+        delegate: delegateAddress,
+      },
+      DEFAULT_METHOD_OPTIONS,
+    );
+
+    const validUntilLedgerSeq = authTtlMinutes
+      ? await calculateValidUntilLedger(RPC_URL, authTtlMinutes)
+      : await calculateValidUntilLedger(RPC_URL, DEFAULT_AUTH_TTL_MINUTES);
+
+    const sentTx = await signAndSendViaLaunchtube(
+      tx,
+      DEFAULT_METHOD_OPTIONS.timeoutInSeconds,
+      validUntilLedgerSeq,
+    );
+
+    return sentTx.result;
+  }
+
+  async getSession(
+    sessionId: number,
+    playerAddress: string,
+    delegateAddress: string,
+  ): Promise<{ expires_ledger: number; uses_left: number } | undefined> {
+    try {
+      const client = this.baseClient as any;
+      if (typeof client.get_session !== 'function') {
+        return undefined;
+      }
+
+      const tx = await client.get_session({
+        session_id: sessionId,
+        player: playerAddress,
+        delegate: delegateAddress,
+      });
+      const result = await tx.simulate();
+      return result.result;
+    } catch {
+      return undefined;
+    }
   }
 
   async getBetToken(): Promise<string | undefined> {

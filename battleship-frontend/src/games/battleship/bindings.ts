@@ -90,12 +90,21 @@ export const Errors = {
   21: {message:"InvalidFeeBps"},
   22: {message:"ZkVerifierNotConfigured"},
   23: {message:"ZkVerificationFailed"},
-  24: {message:"ZkProofRequired"}
+  24: {message:"ZkProofRequired"},
+  25: {message:"InvalidSession"},
+  26: {message:"SessionExpired"},
+  27: {message:"InvalidSessionConfig"}
 }
 
-export type DataKey = {tag: "Game", values: readonly [u32]} | {tag: "GameHubAddress", values: void} | {tag: "Admin", values: void} | {tag: "VerifierPubKey", values: void} | {tag: "ZkVerifierContract", values: void};
+export type DataKey = {tag: "Game", values: readonly [u32]} | {tag: "GameHubAddress", values: void} | {tag: "Admin", values: void} | {tag: "VerifierPubKey", values: void} | {tag: "ZkVerifierContract", values: void} | {tag: "Session", values: readonly [string, string, u32]};
 
 export type ConfigKey = {tag: "BetToken", values: void} | {tag: "FeeRecipient", values: void} | {tag: "FeeBps", values: void};
+
+
+export interface SessionGrant {
+  expires_ledger: u32;
+  uses_left: u32;
+}
 
 export interface Client {
   /**
@@ -279,6 +288,26 @@ export interface Client {
   }) => Promise<AssembledTransaction<u32>>
 
   /**
+   * Construct and simulate a get_session transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  get_session: ({session_id, player, delegate}: {session_id: u32, player: string, delegate: string}, options?: {
+    /**
+     * The fee to pay for the transaction. Default: BASE_FEE
+     */
+    fee?: number;
+
+    /**
+     * The maximum amount of time to wait for the transaction to complete. Default: DEFAULT_TIMEOUT
+     */
+    timeoutInSeconds?: number;
+
+    /**
+     * Whether to automatically simulate the transaction when constructing the AssembledTransaction. Default: true
+     */
+    simulate?: boolean;
+  }) => Promise<AssembledTransaction<Option<SessionGrant>>>
+
+  /**
    * Construct and simulate a set_fee_bps transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
   set_fee_bps: ({fee_bps}: {fee_bps: u32}, options?: {
@@ -459,6 +488,26 @@ export interface Client {
   }) => Promise<AssembledTransaction<Result<void>>>
 
   /**
+   * Construct and simulate a revoke_session transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  revoke_session: ({session_id, player, delegate}: {session_id: u32, player: string, delegate: string}, options?: {
+    /**
+     * The fee to pay for the transaction. Default: BASE_FEE
+     */
+    fee?: number;
+
+    /**
+     * The maximum amount of time to wait for the transaction to complete. Default: DEFAULT_TIMEOUT
+     */
+    timeoutInSeconds?: number;
+
+    /**
+     * Whether to automatically simulate the transaction when constructing the AssembledTransaction. Default: true
+     */
+    simulate?: boolean;
+  }) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
    * Construct and simulate a clear_bet_token transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
   clear_bet_token: (options?: {
@@ -537,6 +586,46 @@ export interface Client {
      */
     simulate?: boolean;
   }) => Promise<AssembledTransaction<null>>
+
+  /**
+   * Construct and simulate a attack_by_session transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  attack_by_session: ({session_id, attacker, delegate, x, y}: {session_id: u32, attacker: string, delegate: string, x: u32, y: u32}, options?: {
+    /**
+     * The fee to pay for the transaction. Default: BASE_FEE
+     */
+    fee?: number;
+
+    /**
+     * The maximum amount of time to wait for the transaction to complete. Default: DEFAULT_TIMEOUT
+     */
+    timeoutInSeconds?: number;
+
+    /**
+     * Whether to automatically simulate the transaction when constructing the AssembledTransaction. Default: true
+     */
+    simulate?: boolean;
+  }) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a authorize_session transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  authorize_session: ({session_id, player, delegate, ttl_ledgers, uses_left}: {session_id: u32, player: string, delegate: string, ttl_ledgers: u32, uses_left: u32}, options?: {
+    /**
+     * The fee to pay for the transaction. Default: BASE_FEE
+     */
+    fee?: number;
+
+    /**
+     * The maximum amount of time to wait for the transaction to complete. Default: DEFAULT_TIMEOUT
+     */
+    timeoutInSeconds?: number;
+
+    /**
+     * Whether to automatically simulate the transaction when constructing the AssembledTransaction. Default: true
+     */
+    simulate?: boolean;
+  }) => Promise<AssembledTransaction<Result<void>>>
 
   /**
    * Construct and simulate a clear_zk_verifier transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
@@ -618,6 +707,46 @@ export interface Client {
     simulate?: boolean;
   }) => Promise<AssembledTransaction<null>>
 
+  /**
+   * Construct and simulate a resolve_attack_by_session transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  resolve_attack_by_session: ({session_id, defender, delegate, is_ship, salt, zk_proof_hash, zk_proof_signature}: {session_id: u32, defender: string, delegate: string, is_ship: boolean, salt: Buffer, zk_proof_hash: Buffer, zk_proof_signature: Option<Buffer>}, options?: {
+    /**
+     * The fee to pay for the transaction. Default: BASE_FEE
+     */
+    fee?: number;
+
+    /**
+     * The maximum amount of time to wait for the transaction to complete. Default: DEFAULT_TIMEOUT
+     */
+    timeoutInSeconds?: number;
+
+    /**
+     * Whether to automatically simulate the transaction when constructing the AssembledTransaction. Default: true
+     */
+    simulate?: boolean;
+  }) => Promise<AssembledTransaction<Result<void>>>
+
+  /**
+   * Construct and simulate a resolve_attack_zk_by_session transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   */
+  resolve_attack_zk_by_session: ({session_id, defender, delegate, zk_attack_proof}: {session_id: u32, defender: string, delegate: string, zk_attack_proof: Buffer}, options?: {
+    /**
+     * The fee to pay for the transaction. Default: BASE_FEE
+     */
+    fee?: number;
+
+    /**
+     * The maximum amount of time to wait for the transaction to complete. Default: DEFAULT_TIMEOUT
+     */
+    timeoutInSeconds?: number;
+
+    /**
+     * Whether to automatically simulate the transaction when constructing the AssembledTransaction. Default: true
+     */
+    simulate?: boolean;
+  }) => Promise<AssembledTransaction<Result<void>>>
+
 }
 export class Client extends ContractClient {
   static async deploy<T = Client>(
@@ -639,9 +768,10 @@ export class Client extends ContractClient {
   constructor(public readonly options: ContractClientOptions) {
     super(
       new ContractSpec([ "AAAAAQAAAAAAAAAAAAAABEdhbWUAAAAYAAAAAAAAAApib2FyZF9zaXplAAAAAAAEAAAAAAAAABBwYXlvdXRfcHJvY2Vzc2VkAAAAAQAAAAAAAAAQcGVuZGluZ19hdHRhY2tlcgAAA+gAAAATAAAAAAAAABBwZW5kaW5nX2RlZmVuZGVyAAAD6AAAABMAAAAAAAAACXBlbmRpbmdfeAAAAAAAA+gAAAAEAAAAAAAAAAlwZW5kaW5nX3kAAAAAAAPoAAAABAAAAAAAAAAHcGxheWVyMQAAAAATAAAAAAAAAA9wbGF5ZXIxX2F0dGFja3MAAAAD6gAAAAQAAAAAAAAADXBsYXllcjFfYm9hcmQAAAAAAAPoAAAD6gAAA+4AAAAgAAAAAAAAABFwbGF5ZXIxX2RlcG9zaXRlZAAAAAAAAAEAAAAAAAAAE3BsYXllcjFfaGl0X2F0dGFja3MAAAAD6gAAAAQAAAAAAAAADHBsYXllcjFfaGl0cwAAAAQAAAAAAAAADnBsYXllcjFfcG9pbnRzAAAAAAALAAAAAAAAABJwbGF5ZXIxX3NoaXBfY2VsbHMAAAAAA+gAAAAEAAAAAAAAAAdwbGF5ZXIyAAAAABMAAAAAAAAAD3BsYXllcjJfYXR0YWNrcwAAAAPqAAAABAAAAAAAAAANcGxheWVyMl9ib2FyZAAAAAAAA+gAAAPqAAAD7gAAACAAAAAAAAAAEXBsYXllcjJfZGVwb3NpdGVkAAAAAAAAAQAAAAAAAAATcGxheWVyMl9oaXRfYXR0YWNrcwAAAAPqAAAABAAAAAAAAAAMcGxheWVyMl9oaXRzAAAABAAAAAAAAAAOcGxheWVyMl9wb2ludHMAAAAAAAsAAAAAAAAAEnBsYXllcjJfc2hpcF9jZWxscwAAAAAD6AAAAAQAAAAAAAAABHR1cm4AAAPoAAAAEwAAAAAAAAAGd2lubmVyAAAAAAPoAAAAEw==",
-        "AAAABAAAAAAAAAAAAAAABUVycm9yAAAAAAAAGAAAAAAAAAAMR2FtZU5vdEZvdW5kAAAAAQAAAAAAAAAJTm90UGxheWVyAAAAAAAAAgAAAAAAAAAQR2FtZUFscmVhZHlFbmRlZAAAAAMAAAAAAAAAHEludmFsaWRCb2FyZENvbW1pdG1lbnRMZW5ndGgAAAAEAAAAAAAAABVCb2FyZEFscmVhZHlDb21taXR0ZWQAAAAAAAAFAAAAAAAAAA5Cb2FyZHNOb3RSZWFkeQAAAAAABgAAAAAAAAALTm90WW91clR1cm4AAAAABwAAAAAAAAARSW52YWxpZENvb3JkaW5hdGUAAAAAAAAIAAAAAAAAAA9BbHJlYWR5QXR0YWNrZWQAAAAACQAAAAAAAAAXUGVuZGluZ0F0dGFja1Jlc29sdXRpb24AAAAACgAAAAAAAAAPTm9QZW5kaW5nQXR0YWNrAAAAAAsAAAAAAAAAEk5vdFBlbmRpbmdEZWZlbmRlcgAAAAAADAAAAAAAAAARSW52YWxpZENlbGxSZXZlYWwAAAAAAAANAAAAAAAAABBJbnZhbGlkU2hpcENvdW50AAAADgAAAAAAAAAQSW52YWxpZFByb29mSGFzaAAAAA8AAAAAAAAAFU1pc3NpbmdQcm9vZlNpZ25hdHVyZQAAAAAAABAAAAAAAAAAEkludmFsaWRTdGFrZUFtb3VudAAAAAAAEQAAAAAAAAAVQmV0VG9rZW5Ob3RDb25maWd1cmVkAAAAAAAAEgAAAAAAAAAQQWxyZWFkeURlcG9zaXRlZAAAABMAAAAAAAAAD1N0YWtlc05vdEZ1bmRlZAAAAAAUAAAAAAAAAA1JbnZhbGlkRmVlQnBzAAAAAAAAFQAAAAAAAAAXWmtWZXJpZmllck5vdENvbmZpZ3VyZWQAAAAAFgAAAAAAAAAUWmtWZXJpZmljYXRpb25GYWlsZWQAAAAXAAAAAAAAAA9aa1Byb29mUmVxdWlyZWQAAAAAGA==",
-        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABQAAAAEAAAAAAAAABEdhbWUAAAABAAAABAAAAAAAAAAAAAAADkdhbWVIdWJBZGRyZXNzAAAAAAAAAAAAAAAAAAVBZG1pbgAAAAAAAAAAAAAAAAAADlZlcmlmaWVyUHViS2V5AAAAAAAAAAAAAAAAABJaa1ZlcmlmaWVyQ29udHJhY3QAAA==",
+        "AAAABAAAAAAAAAAAAAAABUVycm9yAAAAAAAAGwAAAAAAAAAMR2FtZU5vdEZvdW5kAAAAAQAAAAAAAAAJTm90UGxheWVyAAAAAAAAAgAAAAAAAAAQR2FtZUFscmVhZHlFbmRlZAAAAAMAAAAAAAAAHEludmFsaWRCb2FyZENvbW1pdG1lbnRMZW5ndGgAAAAEAAAAAAAAABVCb2FyZEFscmVhZHlDb21taXR0ZWQAAAAAAAAFAAAAAAAAAA5Cb2FyZHNOb3RSZWFkeQAAAAAABgAAAAAAAAALTm90WW91clR1cm4AAAAABwAAAAAAAAARSW52YWxpZENvb3JkaW5hdGUAAAAAAAAIAAAAAAAAAA9BbHJlYWR5QXR0YWNrZWQAAAAACQAAAAAAAAAXUGVuZGluZ0F0dGFja1Jlc29sdXRpb24AAAAACgAAAAAAAAAPTm9QZW5kaW5nQXR0YWNrAAAAAAsAAAAAAAAAEk5vdFBlbmRpbmdEZWZlbmRlcgAAAAAADAAAAAAAAAARSW52YWxpZENlbGxSZXZlYWwAAAAAAAANAAAAAAAAABBJbnZhbGlkU2hpcENvdW50AAAADgAAAAAAAAAQSW52YWxpZFByb29mSGFzaAAAAA8AAAAAAAAAFU1pc3NpbmdQcm9vZlNpZ25hdHVyZQAAAAAAABAAAAAAAAAAEkludmFsaWRTdGFrZUFtb3VudAAAAAAAEQAAAAAAAAAVQmV0VG9rZW5Ob3RDb25maWd1cmVkAAAAAAAAEgAAAAAAAAAQQWxyZWFkeURlcG9zaXRlZAAAABMAAAAAAAAAD1N0YWtlc05vdEZ1bmRlZAAAAAAUAAAAAAAAAA1JbnZhbGlkRmVlQnBzAAAAAAAAFQAAAAAAAAAXWmtWZXJpZmllck5vdENvbmZpZ3VyZWQAAAAAFgAAAAAAAAAUWmtWZXJpZmljYXRpb25GYWlsZWQAAAAXAAAAAAAAAA9aa1Byb29mUmVxdWlyZWQAAAAAGAAAAAAAAAAOSW52YWxpZFNlc3Npb24AAAAAABkAAAAAAAAADlNlc3Npb25FeHBpcmVkAAAAAAAaAAAAAAAAABRJbnZhbGlkU2Vzc2lvbkNvbmZpZwAAABs=",
+        "AAAAAgAAAAAAAAAAAAAAB0RhdGFLZXkAAAAABgAAAAEAAAAAAAAABEdhbWUAAAABAAAABAAAAAAAAAAAAAAADkdhbWVIdWJBZGRyZXNzAAAAAAAAAAAAAAAAAAVBZG1pbgAAAAAAAAAAAAAAAAAADlZlcmlmaWVyUHViS2V5AAAAAAAAAAAAAAAAABJaa1ZlcmlmaWVyQ29udHJhY3QAAAAAAAEAAAAAAAAAB1Nlc3Npb24AAAAAAwAAABMAAAATAAAABA==",
         "AAAAAgAAAAAAAAAAAAAACUNvbmZpZ0tleQAAAAAAAAMAAAAAAAAAAAAAAAhCZXRUb2tlbgAAAAAAAAAAAAAADEZlZVJlY2lwaWVudAAAAAAAAAAAAAAABkZlZUJwcwAA",
+        "AAAAAQAAAAAAAAAAAAAADFNlc3Npb25HcmFudAAAAAIAAAAAAAAADmV4cGlyZXNfbGVkZ2VyAAAAAAAEAAAAAAAAAAl1c2VzX2xlZnQAAAAAAAAE",
         "AAAAAAAAAAAAAAAGYXR0YWNrAAAAAAAEAAAAAAAAAApzZXNzaW9uX2lkAAAAAAAEAAAAAAAAAAhhdHRhY2tlcgAAABMAAAAAAAAAAXgAAAAAAAAEAAAAAAAAAAF5AAAAAAAABAAAAAEAAAPpAAAAAgAAAAM=",
         "AAAAAAAAAAAAAAAHZ2V0X2h1YgAAAAAAAAAAAQAAABM=",
         "AAAAAAAAAAAAAAAHc2V0X2h1YgAAAAABAAAAAAAAAAduZXdfaHViAAAAABMAAAAA",
@@ -651,6 +781,7 @@ export class Client extends ContractClient {
         "AAAAAAAAAAAAAAAJc2V0X2FkbWluAAAAAAAAAQAAAAAAAAAJbmV3X2FkbWluAAAAAAAAEwAAAAA=",
         "AAAAAAAAAAAAAAAKc3RhcnRfZ2FtZQAAAAAABQAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAHcGxheWVyMQAAAAATAAAAAAAAAAdwbGF5ZXIyAAAAABMAAAAAAAAADnBsYXllcjFfcG9pbnRzAAAAAAALAAAAAAAAAA5wbGF5ZXIyX3BvaW50cwAAAAAACwAAAAEAAAPpAAAAAgAAAAM=",
         "AAAAAAAAAAAAAAALZ2V0X2ZlZV9icHMAAAAAAAAAAAEAAAAE",
+        "AAAAAAAAAAAAAAALZ2V0X3Nlc3Npb24AAAAAAwAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAGcGxheWVyAAAAAAATAAAAAAAAAAhkZWxlZ2F0ZQAAABMAAAABAAAD6AAAB9AAAAAMU2Vzc2lvbkdyYW50",
         "AAAAAAAAAAAAAAALc2V0X2ZlZV9icHMAAAAAAQAAAAAAAAAHZmVlX2JwcwAAAAAEAAAAAQAAA+kAAAACAAAAAw==",
         "AAAAAAAAAAAAAAAMY29tbWl0X2JvYXJkAAAABgAAAAAAAAAKc2Vzc2lvbl9pZAAAAAAABAAAAAAAAAAGcGxheWVyAAAAAAATAAAAAAAAABBjZWxsX2NvbW1pdG1lbnRzAAAD6gAAA+4AAAAgAAAAAAAAAApzaGlwX2NlbGxzAAAAAAAEAAAAAAAAABBib2FyZF9wcm9vZl9oYXNoAAAD6AAAA+4AAAAgAAAAAAAAABVib2FyZF9wcm9vZl9zaWduYXR1cmUAAAAAAAPoAAAD7gAAAEAAAAABAAAD6QAAAAIAAAAD",
         "AAAAAAAAAAAAAAAMZ2V0X3ZlcmlmaWVyAAAAAAAAAAEAAAPoAAAD7gAAACA=",
@@ -661,14 +792,19 @@ export class Client extends ContractClient {
         "AAAAAAAAAAAAAAANc2V0X2JldF90b2tlbgAAAAAAAAEAAAAAAAAADnRva2VuX2NvbnRyYWN0AAAAAAATAAAAAA==",
         "AAAAAAAAAAAAAAAOY2xlYXJfdmVyaWZpZXIAAAAAAAAAAAAA",
         "AAAAAAAAAAAAAAAOcmVzb2x2ZV9hdHRhY2sAAAAAAAYAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAACGRlZmVuZGVyAAAAEwAAAAAAAAAHaXNfc2hpcAAAAAABAAAAAAAAAARzYWx0AAAADgAAAAAAAAANemtfcHJvb2ZfaGFzaAAAAAAAA+4AAAAgAAAAAAAAABJ6a19wcm9vZl9zaWduYXR1cmUAAAAAA+gAAAPuAAAAQAAAAAEAAAPpAAAAAgAAAAM=",
+        "AAAAAAAAAAAAAAAOcmV2b2tlX3Nlc3Npb24AAAAAAAMAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAABnBsYXllcgAAAAAAEwAAAAAAAAAIZGVsZWdhdGUAAAATAAAAAQAAA+kAAAACAAAAAw==",
         "AAAAAAAAAAAAAAAPY2xlYXJfYmV0X3Rva2VuAAAAAAAAAAAA",
         "AAAAAAAAAAAAAAAPY29tbWl0X2JvYXJkX3prAAAAAAUAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAABnBsYXllcgAAAAAAEwAAAAAAAAAQY2VsbF9jb21taXRtZW50cwAAA+oAAAPuAAAAIAAAAAAAAAAKc2hpcF9jZWxscwAAAAAABAAAAAAAAAAOemtfYm9hcmRfcHJvb2YAAAAAAA4AAAABAAAD6QAAAAIAAAAD",
         "AAAAAAAAAAAAAAAPZ2V0X3prX3ZlcmlmaWVyAAAAAAAAAAABAAAD6AAAABM=",
         "AAAAAAAAAAAAAAAPc2V0X3prX3ZlcmlmaWVyAAAAAAEAAAAAAAAAEXZlcmlmaWVyX2NvbnRyYWN0AAAAAAAAEwAAAAA=",
+        "AAAAAAAAAAAAAAARYXR0YWNrX2J5X3Nlc3Npb24AAAAAAAAFAAAAAAAAAApzZXNzaW9uX2lkAAAAAAAEAAAAAAAAAAhhdHRhY2tlcgAAABMAAAAAAAAACGRlbGVnYXRlAAAAEwAAAAAAAAABeAAAAAAAAAQAAAAAAAAAAXkAAAAAAAAEAAAAAQAAA+kAAAACAAAAAw==",
+        "AAAAAAAAAAAAAAARYXV0aG9yaXplX3Nlc3Npb24AAAAAAAAFAAAAAAAAAApzZXNzaW9uX2lkAAAAAAAEAAAAAAAAAAZwbGF5ZXIAAAAAABMAAAAAAAAACGRlbGVnYXRlAAAAEwAAAAAAAAALdHRsX2xlZGdlcnMAAAAABAAAAAAAAAAJdXNlc19sZWZ0AAAAAAAABAAAAAEAAAPpAAAAAgAAAAM=",
         "AAAAAAAAAAAAAAARY2xlYXJfemtfdmVyaWZpZXIAAAAAAAAAAAAAAA==",
         "AAAAAAAAAAAAAAARZ2V0X2ZlZV9yZWNpcGllbnQAAAAAAAAAAAAAAQAAABM=",
         "AAAAAAAAAAAAAAARcmVzb2x2ZV9hdHRhY2tfemsAAAAAAAADAAAAAAAAAApzZXNzaW9uX2lkAAAAAAAEAAAAAAAAAAhkZWZlbmRlcgAAABMAAAAAAAAAD3prX2F0dGFja19wcm9vZgAAAAAOAAAAAQAAA+kAAAACAAAAAw==",
-        "AAAAAAAAAAAAAAARc2V0X2ZlZV9yZWNpcGllbnQAAAAAAAABAAAAAAAAAAlyZWNpcGllbnQAAAAAAAATAAAAAA==" ]),
+        "AAAAAAAAAAAAAAARc2V0X2ZlZV9yZWNpcGllbnQAAAAAAAABAAAAAAAAAAlyZWNpcGllbnQAAAAAAAATAAAAAA==",
+        "AAAAAAAAAAAAAAAZcmVzb2x2ZV9hdHRhY2tfYnlfc2Vzc2lvbgAAAAAAAAcAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAACGRlZmVuZGVyAAAAEwAAAAAAAAAIZGVsZWdhdGUAAAATAAAAAAAAAAdpc19zaGlwAAAAAAEAAAAAAAAABHNhbHQAAAAOAAAAAAAAAA16a19wcm9vZl9oYXNoAAAAAAAD7gAAACAAAAAAAAAAEnprX3Byb29mX3NpZ25hdHVyZQAAAAAD6AAAA+4AAABAAAAAAQAAA+kAAAACAAAAAw==",
+        "AAAAAAAAAAAAAAAccmVzb2x2ZV9hdHRhY2tfemtfYnlfc2Vzc2lvbgAAAAQAAAAAAAAACnNlc3Npb25faWQAAAAAAAQAAAAAAAAACGRlZmVuZGVyAAAAEwAAAAAAAAAIZGVsZWdhdGUAAAATAAAAAAAAAA96a19hdHRhY2tfcHJvb2YAAAAADgAAAAEAAAPpAAAAAgAAAAM=" ]),
       options
     )
   }
@@ -682,6 +818,7 @@ export class Client extends ContractClient {
         set_admin: this.txFromJSON<null>,
         start_game: this.txFromJSON<Result<void>>,
         get_fee_bps: this.txFromJSON<u32>,
+        get_session: this.txFromJSON<Option<SessionGrant>>,
         set_fee_bps: this.txFromJSON<Result<void>>,
         commit_board: this.txFromJSON<Result<void>>,
         get_verifier: this.txFromJSON<Option<Buffer>>,
@@ -691,13 +828,18 @@ export class Client extends ContractClient {
         set_bet_token: this.txFromJSON<null>,
         clear_verifier: this.txFromJSON<null>,
         resolve_attack: this.txFromJSON<Result<void>>,
+        revoke_session: this.txFromJSON<Result<void>>,
         clear_bet_token: this.txFromJSON<null>,
         commit_board_zk: this.txFromJSON<Result<void>>,
         get_zk_verifier: this.txFromJSON<Option<string>>,
         set_zk_verifier: this.txFromJSON<null>,
+        attack_by_session: this.txFromJSON<Result<void>>,
+        authorize_session: this.txFromJSON<Result<void>>,
         clear_zk_verifier: this.txFromJSON<null>,
         get_fee_recipient: this.txFromJSON<string>,
         resolve_attack_zk: this.txFromJSON<Result<void>>,
-        set_fee_recipient: this.txFromJSON<null>
+        set_fee_recipient: this.txFromJSON<null>,
+        resolve_attack_by_session: this.txFromJSON<Result<void>>,
+        resolve_attack_zk_by_session: this.txFromJSON<Result<void>>
   }
 }

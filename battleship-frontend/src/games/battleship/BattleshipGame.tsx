@@ -13,6 +13,7 @@ import {
   requestAttackZkProof,
   requestBoardZkProof,
 } from './noirProofService';
+import { createSessionKeySigner, type SessionKeySigner } from './sessionKeySigner';
 
 const BOARD_SIZE = 10;
 const CELL_COUNT = BOARD_SIZE * BOARD_SIZE;
@@ -124,6 +125,7 @@ export function BattleshipGame() {
   const [betTokenContract, setBetTokenContract] = useState<string | undefined>(undefined);
   const [boardSecrets, setBoardSecrets] = useState<LocalCellSecret[] | null>(null);
   const [boardCommitted, setBoardCommitted] = useState(false);
+  const [sessionSigner, setSessionSigner] = useState<SessionKeySigner | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
@@ -336,6 +338,7 @@ export function BattleshipGame() {
     setOnChainGame(null);
     setBoardCommitted(false);
     setBoardSecrets(null);
+    setSessionSigner(null);
   }
 
   function isOnChainMultiplayerMode() {
@@ -498,8 +501,8 @@ export function BattleshipGame() {
       try {
         setIsSyncingChain(true);
         setChainStatus('Resolving incoming attack on-chain (zk)...');
-        const signer = getContractSigner();
-        await battleshipService.resolveAttackZk(sessionId, myAddress, zk.proof, signer);
+        const signer = sessionSigner?.signer || getContractSigner();
+        await battleshipService.resolveAttackZk(sessionId, myAddress, zk.proof, signer, sessionSigner?.publicKey);
         setChainStatus('Incoming attack resolved.');
       } catch (err) {
         if (isNoPendingAttackError(err)) {
@@ -536,7 +539,7 @@ export function BattleshipGame() {
     try {
       setIsSyncingChain(true);
       setChainStatus('Resolving incoming attack on-chain...');
-      const signer = getContractSigner();
+      const signer = sessionSigner?.signer || getContractSigner();
       await battleshipService.resolveAttack(
         sessionId,
         myAddress,
@@ -545,6 +548,7 @@ export function BattleshipGame() {
         zkProofHash,
         zkProofSignature,
         signer,
+        sessionSigner?.publicKey,
       );
       setChainStatus('Incoming attack resolved.');
     } catch (err) {
@@ -554,6 +558,56 @@ export function BattleshipGame() {
       } else {
         setError(err instanceof Error ? err.message : 'Failed to resolve pending attack.');
       }
+    } finally {
+      setIsSyncingChain(false);
+    }
+  }
+
+  async function enableSessionDelegation() {
+    if (!battleshipService || !publicKey) return;
+
+    try {
+      setIsSyncingChain(true);
+      setChainStatus('Authorizing one-tap turn signing...');
+      const nextSessionSigner = createSessionKeySigner();
+      const walletSigner = getContractSigner();
+
+      await battleshipService.authorizeSession(
+        sessionId,
+        publicKey,
+        nextSessionSigner.publicKey,
+        7200,
+        0,
+        walletSigner,
+      );
+
+      setSessionSigner(nextSessionSigner);
+      setError(null);
+      setSuccess('One-tap turn signing enabled for this match.');
+      setChainStatus('One-tap signing active. Wallet will not open for each turn.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to enable one-tap signing.');
+    } finally {
+      setIsSyncingChain(false);
+    }
+  }
+
+  async function revokeSessionDelegation() {
+    if (!battleshipService || !publicKey || !sessionSigner) {
+      setSessionSigner(null);
+      return;
+    }
+
+    try {
+      setIsSyncingChain(true);
+      setChainStatus('Revoking one-tap turn signing...');
+      const walletSigner = getContractSigner();
+      await battleshipService.revokeSession(sessionId, publicKey, sessionSigner.publicKey, walletSigner);
+      setSessionSigner(null);
+      setSuccess('One-tap signing revoked.');
+      setChainStatus('One-tap signing is off.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to revoke one-tap signing.');
     } finally {
       setIsSyncingChain(false);
     }
@@ -813,6 +867,7 @@ export function BattleshipGame() {
     setIsSyncingChain(false);
     setError(null);
     setSuccess(null);
+    setSessionSigner(null);
     setScreen('home');
   }
 
@@ -968,8 +1023,8 @@ export function BattleshipGame() {
       try {
         setIsSyncingChain(true);
         setChainStatus('Submitting attack on-chain...');
-        const signer = getContractSigner();
-        await battleshipService.submitAttack(sessionId, publicKey, x, y, signer);
+        const signer = sessionSigner?.signer || getContractSigner();
+        await battleshipService.submitAttack(sessionId, publicKey, x, y, signer, sessionSigner?.publicKey);
         setError(null);
         setSuccess('Attack submitted on-chain. Waiting for resolution.');
         await refreshOnChainGame(publicKey);
@@ -1187,6 +1242,12 @@ export function BattleshipGame() {
     setError(null);
     setSuccess('Invite loaded. Configure your playground and continue.');
   }, []);
+
+  useEffect(() => {
+    if (!publicKey) {
+      setSessionSigner(null);
+    }
+  }, [publicKey]);
 
   const LOGO = `
 ██████   █████  ████████ ████████ ██      ███████ ███████ ██   ██ ██ ██████  
@@ -1622,6 +1683,25 @@ export function BattleshipGame() {
         </div>
 
         {isOnChainMultiplayerMode() && chainStatus && <div className="notice success">{chainStatus}</div>}
+
+        {isOnChainMultiplayerMode() && publicKey && (
+          <div className="card" style={{ display: 'grid', gap: 10 }}>
+            <div className="inline-hint">
+              {sessionSigner
+                ? `One-tap signing active via delegated key ${sessionSigner.publicKey.slice(0, 6)}...${sessionSigner.publicKey.slice(-6)}.`
+                : 'Enable one-tap signing once to avoid wallet popup on every attack/resolve.'}
+            </div>
+            {sessionSigner ? (
+              <button className="btn-secondary" disabled={isSyncingChain} onClick={revokeSessionDelegation}>
+                {isSyncingChain ? 'Revoking...' : 'Disable One-Tap Signing'}
+              </button>
+            ) : (
+              <button className="btn-primary" disabled={isSyncingChain} onClick={enableSessionDelegation}>
+                {isSyncingChain ? 'Authorizing...' : 'Enable One-Tap Signing'}
+              </button>
+            )}
+          </div>
+        )}
 
         {isOnChainMultiplayerMode()
           && onChainGame
