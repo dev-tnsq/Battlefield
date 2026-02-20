@@ -15,6 +15,7 @@
     "prover:set-bet-token": "bun run scripts/noir-verifier.ts set-bet-token",
     "prover:clear-bet-token": "bun run scripts/noir-verifier.ts clear-bet-token",
     "prover:set-fee": "bun run scripts/noir-verifier.ts set-fee",
+    "prover:status": "bun run scripts/noir-verifier.ts status",
     "prover:dev": "bun run scripts/noir-prover.ts",
     "zk:up": "bun run scripts/zk-up.ts",
     "dev": "bun --cwd=battleship-frontend run dev",

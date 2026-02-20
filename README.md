@@ -21,9 +21,8 @@ bun run bindings battleship
 # Noir prover + verifier (privacy attestation mode)
 bun run prover:init      # generate prover key + env values
 bun run prover:set       # set verifier pubkey on battleship contract (admin)
-bun run prover:set-fee   # set fee bps from BATTLESHIP_FEE_BPS (default 500)
-# export BET_TOKEN_CONTRACT_ID=<SAC token contract id>
-bun run prover:set-bet-token  # set wager escrow token contract
+bun run prover:set-fee   # set fee bps from BATTLESHIP_FEE_BPS (default 0; winner gets full pot)
+bun run prover:set-bet-token  # set wager escrow token to native XLM
 ## Optional (next phase): set trustless zk verifier contract on battleship
 # export NOIR_ZK_VERIFIER_CONTRACT_ID=<your zk verifier contract id>
 # bun run prover:set-zk
