@@ -22,9 +22,9 @@ function keccak256Bytes(parts: Uint8Array[]) {
 }
 
 const env = await readEnvFile('.env');
-const proverSecret = getEnvValue(env, 'NOIR_PROVER_SECRET');
+const proverSecret = process.env.NOIR_PROVER_SECRET || getEnvValue(env, 'NOIR_PROVER_SECRET');
 if (!proverSecret) {
-  console.error('❌ NOIR_PROVER_SECRET is missing in .env. Run: bun run prover:init');
+  console.error('❌ NOIR_PROVER_SECRET is missing (set Render env var or .env). Run: bun run prover:init');
   process.exit(1);
 }
 
