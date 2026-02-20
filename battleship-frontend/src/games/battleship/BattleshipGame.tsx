@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './classic.css';
 import { Buffer } from 'buffer';
 import { keccak_256 } from 'js-sha3';
@@ -10,10 +10,16 @@ import type { Game as ContractGame } from './bindings';
 import {
   isNoirProverConfigured,
   requestAttackResolutionAttestation,
+  requestBoardCommitmentAttestation,
   requestAttackZkProof,
   requestBoardZkProof,
 } from './noirProofService';
-import { createSessionKeySigner, type SessionKeySigner } from './sessionKeySigner';
+import {
+  createSessionKeySigner,
+  createSessionKeySignerFromSecret,
+  ensureSessionSignerAccountReady,
+  type SessionKeySigner,
+} from './sessionKeySigner';
 
 const BOARD_SIZE = 10;
 const CELL_COUNT = BOARD_SIZE * BOARD_SIZE;
@@ -101,16 +107,92 @@ interface LocalCellSecret {
   isShip: boolean;
 }
 
+interface PersistedCellSecret {
+  saltBase64: string;
+  isShip: boolean;
+}
+
+interface PersistedBattleState {
+  version: 1;
+  contractId: string;
+  owner: string;
+  mode: Mode;
+  screen: Screen;
+  onChainEnabled: boolean;
+  sessionId: number;
+  fleetPreset: FleetPreset;
+  theme: ThemeMode;
+  difficulty: Difficulty;
+  matchType: MatchType;
+  boardScale: BoardScale;
+  player1Points: string;
+  player2Points: string;
+  player2Address: string;
+  ships: ShipPlacement[];
+  boardCommitted: boolean;
+  boardSecrets: PersistedCellSecret[] | null;
+  sessionSignerSecret: string | null;
+}
+
+const AUTO_JOIN_CONNECT_WALLET_STATUS = 'Connect your wallet to auto-join this invite.';
+const BATTLE_PERSIST_KEY = 'battleship:onchain:active:v1';
+const START_STEP_DELAY_MS = 800;
+const STAKE_POLL_INTERVAL_MS = 2500;
+const STAKE_WAIT_TIMEOUT_MS = 60000;
+const STROOPS_PER_XLM = 10_000_000n;
+const TESTNET_HORIZON_URL = 'https://horizon-testnet.stellar.org';
+const PUBLIC_HORIZON_URL = 'https://horizon.stellar.org';
+
+const SCREEN_ROUTE: Record<Screen, string> = {
+  home: '/battleship',
+  setup: '/battleship/setup',
+  placement: '/battleship/placement',
+  battle: '/battleship/battle',
+};
+
+function screenFromRoute(route: string): Screen {
+  if (route.endsWith('/setup')) return 'setup';
+  if (/\/placement(\/\d+)?$/.test(route)) return 'placement';
+  if (/\/battle(\/\d+)?$/.test(route)) return 'battle';
+  return 'home';
+}
+
+function getRouteStateFromHash(): { screen: Screen; sessionId?: number } {
+  if (typeof window === 'undefined') return { screen: 'home' };
+  const hash = window.location.hash || '';
+  if (!hash.startsWith('#')) return { screen: 'home' };
+  const route = hash.slice(1) || '/battleship';
+  const sessionMatch = route.match(/\/(placement|battle)\/(\d+)$/);
+  const parsedSessionId = sessionMatch ? Number(sessionMatch[2]) : undefined;
+  return {
+    screen: screenFromRoute(route),
+    sessionId: Number.isFinite(parsedSessionId) ? parsedSessionId : undefined,
+  };
+}
+
+function hashForScreen(screen: Screen, sessionId?: number, includeSessionInPath = false): string {
+  if (includeSessionInPath && (screen === 'placement' || screen === 'battle') && typeof sessionId === 'number') {
+    return `#${SCREEN_ROUTE[screen]}/${sessionId}`;
+  }
+  return `#${SCREEN_ROUTE[screen]}`;
+}
+
 export function BattleshipGame() {
+  const autoJoinAttemptedRef = useRef(false);
+  const autoResolveInFlightRef = useRef(false);
+  const rehydratedRef = useRef(false);
   const [fleetPreset, setFleetPreset] = useState<FleetPreset>('classic');
   const [fleetBlueprint, setFleetBlueprint] = useState(FLEET_PRESETS.classic.ships);
-  const [screen, setScreen] = useState<Screen>('home');
+  const [screen, setScreen] = useState<Screen>(() => getRouteStateFromHash().screen);
   const [mode, setMode] = useState<Mode>('solo');
   const [theme, setTheme] = useState<ThemeMode>('green');
   const [difficulty, setDifficulty] = useState<Difficulty>('normal');
   const [matchType, setMatchType] = useState<MatchType>('free');
   const [boardScale, setBoardScale] = useState<BoardScale>('standard');
-  const [sessionId, setSessionId] = useState<number>(() => Math.floor(Math.random() * 1_000_000_000));
+  const [sessionId, setSessionId] = useState<number>(() => {
+    const routeSession = getRouteStateFromHash().sessionId;
+    return typeof routeSession === 'number' ? routeSession : Math.floor(Math.random() * 1_000_000_000);
+  });
   const [player2Address, setPlayer2Address] = useState('');
   const [player1Points, setPlayer1Points] = useState('0.1');
   const [player2Points, setPlayer2Points] = useState('0.1');
@@ -126,8 +208,12 @@ export function BattleshipGame() {
   const [boardSecrets, setBoardSecrets] = useState<LocalCellSecret[] | null>(null);
   const [boardCommitted, setBoardCommitted] = useState(false);
   const [sessionSigner, setSessionSigner] = useState<SessionKeySigner | null>(null);
+  const [isAutoJoiningInvite, setIsAutoJoiningInvite] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
+  const [showRewardModal, setShowRewardModal] = useState(false);
+  const [isRewardClaiming, setIsRewardClaiming] = useState(false);
+  const [lastRewardClaimText, setLastRewardClaimText] = useState<string | null>(null);
 
   const { publicKey, isConnected, getContractSigner } = useWallet();
   const battleshipService = useMemo(() => {
@@ -146,6 +232,27 @@ export function BattleshipGame() {
   const [enemyHits, setEnemyHits] = useState<Set<string>>(new Set());
   const [shotsEnemy, setShotsEnemy] = useState<Set<string>>(new Set());
   const [enemyTargets, setEnemyTargets] = useState<string[]>([]);
+
+  function serializeBoardSecrets(value: LocalCellSecret[] | null): PersistedCellSecret[] | null {
+    if (!value) return null;
+    return value.map((cell) => ({
+      saltBase64: Buffer.from(cell.salt).toString('base64'),
+      isShip: cell.isShip,
+    }));
+  }
+
+  function deserializeBoardSecrets(value: PersistedCellSecret[] | null | undefined): LocalCellSecret[] | null {
+    if (!value) return null;
+    return value.map((cell) => ({
+      salt: Buffer.from(cell.saltBase64, 'base64'),
+      isShip: cell.isShip,
+    }));
+  }
+
+  function clearPersistedBattleState() {
+    if (typeof window === 'undefined') return;
+    window.localStorage.removeItem(BATTLE_PERSIST_KEY);
+  }
 
   const boardMask = useMemo(() => {
     const mask = Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(false));
@@ -454,6 +561,19 @@ export function BattleshipGame() {
     return err.message.includes('NoPendingAttack') || err.message.includes('Contract, #11');
   }
 
+  function isSessionSignerAuthFailure(err: unknown) {
+    if (!(err instanceof Error)) return false;
+    return err.message.includes('Error(Auth, InvalidAction)')
+      || err.message.includes('Error(Value, UnexpectedType)')
+      || err.message.includes('failed account authentication')
+      || err.message.includes('Account not found');
+  }
+
+  function shortAddress(address: string | null | undefined) {
+    if (!address) return 'none';
+    return `${address.slice(0, 6)}...${address.slice(-6)}`;
+  }
+
   async function resolvePendingAttackIfNeeded(game: ContractGame, myAddress: string) {
     if (!battleshipService || !boardSecrets) return;
     const pendingDefender = optionValue<string>(game.pending_defender);
@@ -468,6 +588,27 @@ export function BattleshipGame() {
       setError('Missing local board secret for pending attack resolution.');
       return;
     }
+
+    if (!sessionSigner) {
+      setError('Enable One-Tap Signing to resolve in-game attacks without wallet popups.');
+      return;
+    }
+
+    const sessionGrant = await battleshipService.getSession(sessionId, myAddress, sessionSigner.publicKey);
+    console.info('[one-tap] Pre-resolve session grant check', {
+      sessionId,
+      defender: shortAddress(myAddress),
+      delegate: shortAddress(sessionSigner.publicKey),
+      grant: sessionGrant,
+    });
+    if (!sessionGrant) {
+      setSessionSigner(null);
+      setError('One-Tap Signing grant not found on-chain. Please enable One-Tap Signing again.');
+      setChainStatus('One-tap signing is off.');
+      return;
+    }
+
+    await ensureSessionSignerAccountReady(sessionSigner.publicKey);
 
     const proofPayload = Buffer.concat([
       Buffer.from([secret.isShip ? 1 : 0]),
@@ -501,13 +642,22 @@ export function BattleshipGame() {
       try {
         setIsSyncingChain(true);
         setChainStatus('Resolving incoming attack on-chain (zk)...');
-        const signer = sessionSigner?.signer || getContractSigner();
-        await battleshipService.resolveAttackZk(sessionId, myAddress, zk.proof, signer, sessionSigner?.publicKey);
+        await battleshipService.resolveAttackZk(
+          sessionId,
+          myAddress,
+          zk.proof,
+          sessionSigner.signer,
+          sessionSigner.publicKey,
+        );
         setChainStatus('Incoming attack resolved.');
       } catch (err) {
         if (isNoPendingAttackError(err)) {
           setError(null);
           setChainStatus('Incoming attack was already resolved on-chain.');
+        } else if (isSessionSignerAuthFailure(err)) {
+          setSessionSigner(null);
+          setError('Delegated signer authentication failed. One-Tap Signing was disabled; enable it again to continue without wallet popups.');
+          setChainStatus('One-tap signing is off.');
         } else {
           setError(err instanceof Error ? err.message : 'Failed to resolve pending attack.');
         }
@@ -539,7 +689,6 @@ export function BattleshipGame() {
     try {
       setIsSyncingChain(true);
       setChainStatus('Resolving incoming attack on-chain...');
-      const signer = sessionSigner?.signer || getContractSigner();
       await battleshipService.resolveAttack(
         sessionId,
         myAddress,
@@ -547,14 +696,18 @@ export function BattleshipGame() {
         secret.salt,
         zkProofHash,
         zkProofSignature,
-        signer,
-        sessionSigner?.publicKey,
+        sessionSigner.signer,
+        sessionSigner.publicKey,
       );
       setChainStatus('Incoming attack resolved.');
     } catch (err) {
       if (isNoPendingAttackError(err)) {
         setError(null);
         setChainStatus('Incoming attack was already resolved on-chain.');
+      } else if (isSessionSignerAuthFailure(err)) {
+        setSessionSigner(null);
+        setError('Delegated signer authentication failed. One-Tap Signing was disabled; enable it again to continue without wallet popups.');
+        setChainStatus('One-tap signing is off.');
       } else {
         setError(err instanceof Error ? err.message : 'Failed to resolve pending attack.');
       }
@@ -568,9 +721,19 @@ export function BattleshipGame() {
 
     try {
       setIsSyncingChain(true);
-      setChainStatus('Authorizing one-tap turn signing...');
+      setChainStatus('Preparing delegated signer account...');
       const nextSessionSigner = createSessionKeySigner();
       const walletSigner = getContractSigner();
+
+      console.info('[one-tap] Enabling delegated signer', {
+        sessionId,
+        player: shortAddress(publicKey),
+        delegate: shortAddress(nextSessionSigner.publicKey),
+      });
+
+      await ensureSessionSignerAccountReady(nextSessionSigner.publicKey);
+
+      setChainStatus('Authorizing one-tap turn signing...');
 
       await battleshipService.authorizeSession(
         sessionId,
@@ -581,11 +744,25 @@ export function BattleshipGame() {
         walletSigner,
       );
 
+      const grant = await battleshipService.getSession(sessionId, publicKey, nextSessionSigner.publicKey);
+      console.info('[one-tap] Session grant after authorize_session', {
+        sessionId,
+        player: shortAddress(publicKey),
+        delegate: shortAddress(nextSessionSigner.publicKey),
+        grant,
+      });
+      if (!grant) {
+        throw new Error('Session grant was not found after authorization. Please retry enabling One-Tap Signing.');
+      }
+
       setSessionSigner(nextSessionSigner);
       setError(null);
       setSuccess('One-tap turn signing enabled for this match.');
       setChainStatus('One-tap signing active. Wallet will not open for each turn.');
     } catch (err) {
+      if (isSessionSignerAuthFailure(err)) {
+        setSessionSigner(null);
+      }
       setError(err instanceof Error ? err.message : 'Failed to enable one-tap signing.');
     } finally {
       setIsSyncingChain(false);
@@ -632,9 +809,99 @@ export function BattleshipGame() {
     return BigInt(Math.round(parsed * 10_000_000));
   }
 
+  function toBigIntSafe(value: unknown) {
+    try {
+      return BigInt(value as bigint | number | string);
+    } catch {
+      return 0n;
+    }
+  }
+
+  function formatXlmFromStroops(stroops: bigint) {
+    const whole = stroops / STROOPS_PER_XLM;
+    const fraction = (stroops % STROOPS_PER_XLM).toString().padStart(7, '0').replace(/0+$/, '');
+    return fraction.length > 0 ? `${whole.toString()}.${fraction}` : whole.toString();
+  }
+
+  function getHorizonBaseUrl() {
+    return config.networkPassphrase === 'Test SDF Network ; September 2015'
+      ? TESTNET_HORIZON_URL
+      : PUBLIC_HORIZON_URL;
+  }
+
+  async function fetchNativeXlmBalance(address: string) {
+    const response = await fetch(`${getHorizonBaseUrl()}/accounts/${address}`);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch wallet balance (${response.status})`);
+    }
+    const payload = await response.json() as { balances?: Array<{ asset_type?: string; balance?: string }> };
+    const native = payload.balances?.find((entry) => entry.asset_type === 'native');
+    const parsed = Number(native?.balance || '0');
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  async function claimWinnerReward() {
+    if (!battleshipService || !publicKey) return;
+
+    try {
+      setIsRewardClaiming(true);
+      setError(null);
+      setSuccess(null);
+      setChainStatus('Checking winner payout on-chain...');
+
+      const [feeBps, beforeBalance] = await Promise.all([
+        battleshipService.getFeeBps(),
+        fetchNativeXlmBalance(publicKey),
+      ]);
+
+      const latest = await refreshOnChainGame(publicKey);
+      if (!latest) {
+        setError('Could not load latest on-chain match state.');
+        return;
+      }
+
+      const winner = optionValue<string>(latest.winner);
+      if (!winner || winner !== publicKey) {
+        setError('Winner is not finalized for your wallet yet. Please wait a moment and retry.');
+        return;
+      }
+
+      const totalPot = toBigIntSafe(latest.player1_points) + toBigIntSafe(latest.player2_points);
+      const fee = totalPot * BigInt(Math.max(0, feeBps)) / 10_000n;
+      const expectedPayout = totalPot - fee;
+
+      await new Promise((resolve) => setTimeout(resolve, 1200));
+      const afterBalance = await fetchNativeXlmBalance(publicKey);
+      const delta = afterBalance - beforeBalance;
+
+      setLastRewardClaimText(`Expected payout: ${formatXlmFromStroops(expectedPayout)} XLM · Wallet delta: ${delta.toFixed(7)} XLM`);
+      setSuccess(`Reward checked on-chain. Winner payout for this match is ${formatXlmFromStroops(expectedPayout)} XLM.`);
+      setShowRewardModal(false);
+      setChainStatus('Winner payout confirmed.');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Failed to check winner reward.');
+    } finally {
+      setIsRewardClaiming(false);
+    }
+  }
+
+  async function waitForBothStakesFunded(myAddress: string, seedGame?: ContractGame | null): Promise<ContractGame | null> {
+    let currentGame = seedGame || await refreshOnChainGame(myAddress);
+    const deadline = Date.now() + STAKE_WAIT_TIMEOUT_MS;
+
+    while (currentGame && !(currentGame.player1_deposited && currentGame.player2_deposited) && Date.now() < deadline) {
+      const remainingSec = Math.max(1, Math.ceil((deadline - Date.now()) / 1000));
+      setChainStatus(`Step 2/3: Waiting for opponent stake... (${remainingSec}s)`);
+      await new Promise((resolve) => setTimeout(resolve, STAKE_POLL_INTERVAL_MS));
+      currentGame = await refreshOnChainGame(myAddress);
+    }
+
+    return currentGame;
+  }
+
   async function createInviteLink(forceOnChain = onChainEnabled) {
-    if (!player2Address) {
-      setError('Opponent address is required to create an invite link.');
+    if (forceOnChain && !player2Address) {
+      setError('Opponent address is required to create an on-chain invite link.');
       return false;
     }
 
@@ -755,6 +1022,11 @@ export function BattleshipGame() {
   }
 
   function canProceedFromSetup() {
+    if (mode !== 'solo' && onChainEnabled && matchType === 'wager' && !betTokenContract) {
+      setError('Wager is unavailable: XLM staking is not configured on this Battleship contract. Admin must run prover:set-bet-token.');
+      return false;
+    }
+
     if (matchType === 'wager') {
       const mine = Number(player1Points);
       const theirs = Number(player2Points);
@@ -767,8 +1039,8 @@ export function BattleshipGame() {
         return false;
       }
     }
-    if (mode === 'invite' && !player2Address) {
-      setError('Opponent address is required for invite mode.');
+    if (mode === 'invite' && onChainEnabled && !player2Address) {
+      setError('Opponent address is required for on-chain invite mode.');
       return false;
     }
     if (mode === 'join' && !importXdr && !loadedInvitePayload) {
@@ -778,13 +1050,48 @@ export function BattleshipGame() {
     return true;
   }
 
+  function hasCurrentInvitePrepared(forceOnChain = onChainEnabled) {
+    if (!inviteXdr) return false;
+    const parsed = parseInvitePayload(inviteXdr);
+    if (!parsed) return false;
+
+    const coreSettingsMatch =
+      parsed.sessionId === sessionId
+      && parsed.preset === fleetPreset
+      && parsed.theme === theme
+      && parsed.difficulty === difficulty
+      && parsed.matchType === matchType
+      && parsed.boardScale === boardScale
+      && parsed.player1Points === player1Points
+      && parsed.player2Points === player2Points
+      && parsed.player2Address === player2Address;
+
+    if (!coreSettingsMatch) return false;
+
+    if (!forceOnChain) return true;
+
+    const contractId = config.battleshipId || undefined;
+    return Boolean(
+      parsed.signedAuthEntryXdr
+      && parsed.player1Address
+      && publicKey
+      && parsed.player1Address === publicKey
+      && parsed.contractId === contractId,
+    );
+  }
+
   async function continueFromSetup() {
     setSuccess(null);
     if (!canProceedFromSetup()) return;
 
     if (mode === 'invite') {
-      const created = await createInviteLink(onChainEnabled);
-      if (!created) return;
+      const inviteReady = hasCurrentInvitePrepared(onChainEnabled);
+      if (!inviteReady) {
+        const created = await createInviteLink(onChainEnabled);
+        if (!created) return;
+      } else {
+        setSuccess('Using existing invite link. Continuing to ship placement.');
+      }
     }
 
     if (mode === 'join') {
@@ -863,6 +1170,7 @@ export function BattleshipGame() {
   }
 
   function goHome() {
+    clearPersistedBattleState();
     setChainStatus(null);
     setIsSyncingChain(false);
     setError(null);
@@ -894,7 +1202,7 @@ export function BattleshipGame() {
         setEnemyHits(new Set());
         setShotsEnemy(new Set());
         setIsSyncingChain(true);
-        setChainStatus('Checking on-chain session...');
+        setChainStatus('Step 1/3: Checking on-chain session...');
         const game = await refreshOnChainGame(publicKey);
         if (!game) {
           setError('On-chain session not started yet. Ask the other player to join first.');
@@ -905,59 +1213,114 @@ export function BattleshipGame() {
           const tokenContract = await battleshipService.getBetToken();
           setBetTokenContract(tokenContract);
           if (!tokenContract) {
-            setError('Wager mode requires on-chain bet token configuration by admin.');
+            setError('Wager mode requires on-chain XLM staking configuration by admin (run prover:set-bet-token).');
             return;
           }
 
-          try {
-            setChainStatus('Depositing your stake into on-chain escrow...');
-            const signer = getContractSigner();
-            await battleshipService.depositStake(sessionId, publicKey, signer);
-          } catch (depositErr) {
-            const msg = depositErr instanceof Error ? depositErr.message : 'Stake deposit failed.';
-            if (!msg.includes('AlreadyDeposited')) {
-              setError(msg);
-              return;
+          const alreadyDeposited = game.player1 === publicKey
+            ? game.player1_deposited
+            : game.player2 === publicKey
+              ? game.player2_deposited
+              : false;
+
+          if (!alreadyDeposited) {
+            try {
+              setChainStatus('Step 1/3: Depositing your stake into on-chain escrow...');
+              const signer = getContractSigner();
+              await battleshipService.depositStake(sessionId, publicKey, signer);
+              await new Promise((resolve) => setTimeout(resolve, START_STEP_DELAY_MS));
+            } catch (depositErr) {
+              const msg = depositErr instanceof Error ? depositErr.message : 'Stake deposit failed.';
+              if (!msg.includes('AlreadyDeposited')) {
+                setError(msg);
+                return;
+              }
             }
+          } else {
+            setChainStatus('Step 1/3: Stake already deposited. Checking funding state...');
+          }
+
+          await new Promise((resolve) => setTimeout(resolve, START_STEP_DELAY_MS));
+          const stakeState = await waitForBothStakesFunded(publicKey, game);
+          if (!stakeState) {
+            setError('Failed to refresh on-chain stake state. Please retry.');
+            return;
+          }
+          const bothDeposited = Boolean(stakeState.player1_deposited && stakeState.player2_deposited);
+          if (!bothDeposited) {
+            setSuccess('Your stake is deposited. Waiting for opponent stake before commit. Click again when they have deposited.');
+            setChainStatus('Step 2/3: Opponent stake still pending.');
+            return;
           }
         }
-
-        const zkVerifier = await battleshipService.getZkVerifierContract();
-        if (!zkVerifier) {
-          setError('Full private on-chain mode requires zk verifier contract configuration by admin.');
-          return;
-        }
-        setZkVerifierContract(zkVerifier);
 
         const { secrets, commitments, occupied } = buildBoardSecretsFromShips();
         setBoardSecrets(secrets);
 
         const commitmentRoot = computeCommitmentRoot(commitments);
-        const zkBoard = await requestBoardZkProof({
-          sessionId,
-          shipCells: occupied.filter(Boolean).length,
-          commitmentRootHex: commitmentRoot.toString('hex'),
-        });
-        if (!zkBoard) {
-          setError('ZK verifier mode requires prover endpoint configuration (VITE_NOIR_PROVER_URL).');
-          return;
-        }
-
-        setChainStatus('Submitting board commitment on-chain (zk)...');
         const signer = getContractSigner();
-        await battleshipService.commitBoardZk(
-          sessionId,
-          publicKey,
-          commitments,
-          occupied.filter(Boolean).length,
-          zkBoard.proof,
-          signer,
-        );
+        const shipCells = occupied.filter(Boolean).length;
+
+        const zkVerifier = await battleshipService.getZkVerifierContract();
+        setZkVerifierContract(zkVerifier);
+
+        if (zkVerifier) {
+          const zkBoard = await requestBoardZkProof({
+            sessionId,
+            shipCells,
+            commitmentRootHex: commitmentRoot.toString('hex'),
+          });
+          if (!zkBoard) {
+            setError('ZK verifier mode requires prover endpoint configuration (VITE_NOIR_PROVER_URL).');
+            return;
+          }
+
+          setChainStatus('Step 3/3: Submitting board commitment on-chain (zk)...');
+          await battleshipService.commitBoardZk(
+            sessionId,
+            publicKey,
+            commitments,
+            shipCells,
+            zkBoard.proof,
+            signer,
+          );
+        } else {
+          const verifier = await battleshipService.getVerifier();
+          const verifierEnabled = Boolean(verifier && verifier.length > 0);
+          let boardProofHash: Buffer | undefined;
+          let boardProofSignature: Buffer | undefined;
+
+          if (verifierEnabled) {
+            const attestation = await requestBoardCommitmentAttestation({
+              sessionId,
+              shipCells,
+              commitmentRootHex: commitmentRoot.toString('hex'),
+            });
+            if (!attestation) {
+              setError('Verifier mode requires prover endpoint configuration (VITE_NOIR_PROVER_URL).');
+              return;
+            }
+            boardProofHash = attestation.proofHash;
+            boardProofSignature = attestation.signature;
+          }
+
+          setChainStatus('Step 3/3: Submitting board commitment on-chain...');
+          await battleshipService.commitBoard(
+            sessionId,
+            publicKey,
+            commitments,
+            shipCells,
+            boardProofHash,
+            boardProofSignature,
+            signer,
+          );
+        }
 
         setBoardCommitted(true);
         setScreen('battle');
         setSuccess('Board committed on-chain. Battle started.');
         setError(null);
+        await new Promise((resolve) => setTimeout(resolve, START_STEP_DELAY_MS));
 
         const updatedGame = await refreshOnChainGame(publicKey);
         if (updatedGame) {
@@ -970,6 +1333,13 @@ export function BattleshipGame() {
           setScreen('battle');
           setSuccess('Board already committed on-chain. Entering battle.');
           setError(null);
+          await refreshOnChainGame(publicKey);
+          return;
+        }
+        if (message.includes('StakesNotFunded') || message.includes('Error(Contract, #20)')) {
+          setError(null);
+          setSuccess('Stake deposited. Waiting for opponent to deposit before commit can proceed.');
+          setChainStatus('Waiting for opponent to deposit stake...');
           await refreshOnChainGame(publicKey);
           return;
         }
@@ -1020,15 +1390,49 @@ export function BattleshipGame() {
         return;
       }
 
+      if (!sessionSigner) {
+        setError('Enable One-Tap Signing before firing to avoid wallet popup on every turn.');
+        return;
+      }
+
+      const sessionGrant = await battleshipService.getSession(sessionId, publicKey, sessionSigner.publicKey);
+      console.info('[one-tap] Pre-attack session grant check', {
+        sessionId,
+        attacker: shortAddress(publicKey),
+        delegate: shortAddress(sessionSigner.publicKey),
+        grant: sessionGrant,
+      });
+      if (!sessionGrant) {
+        setSessionSigner(null);
+        setError('One-Tap Signing grant not found on-chain. Please enable One-Tap Signing again.');
+        setChainStatus('One-tap signing is off.');
+        return;
+      }
+
+      await ensureSessionSignerAccountReady(sessionSigner.publicKey);
+
       try {
         setIsSyncingChain(true);
         setChainStatus('Submitting attack on-chain...');
-        const signer = sessionSigner?.signer || getContractSigner();
-        await battleshipService.submitAttack(sessionId, publicKey, x, y, signer, sessionSigner?.publicKey);
+        await battleshipService.submitAttack(
+          sessionId,
+          publicKey,
+          x,
+          y,
+          sessionSigner.signer,
+          sessionSigner.publicKey,
+        );
         setError(null);
         setSuccess('Attack submitted on-chain. Waiting for resolution.');
+        setChainStatus(`Attack submitted at (${x}, ${y}). Waiting for defender resolution...`);
         await refreshOnChainGame(publicKey);
       } catch (err) {
+        if (isSessionSignerAuthFailure(err)) {
+          setSessionSigner(null);
+          setError('Delegated signer authentication failed. One-Tap Signing was disabled; enable it again and retry your move.');
+          setChainStatus('One-tap signing is off.');
+          return;
+        }
         setError(err instanceof Error ? err.message : 'Failed to submit on-chain attack.');
       } finally {
         setIsSyncingChain(false);
@@ -1136,10 +1540,28 @@ export function BattleshipGame() {
   const shellStyle = { ['--classic-cell-size' as string]: `${cellSizePx}px` } as React.CSSProperties;
   const totalStake = matchType === 'wager' ? Number(player1Points || 0) + Number(player2Points || 0) : 0;
   const onChainTurn = onChainGame ? optionValue<string>(onChainGame.turn) : undefined;
+  const onChainPendingAttacker = onChainGame ? optionValue<string>(onChainGame.pending_attacker) : undefined;
   const onChainPendingDefender = onChainGame ? optionValue<string>(onChainGame.pending_defender) : undefined;
   const onChainPendingX = onChainGame ? optionValue<number>(onChainGame.pending_x) : undefined;
   const onChainPendingY = onChainGame ? optionValue<number>(onChainGame.pending_y) : undefined;
   const myOnChainTurn = Boolean(publicKey && onChainTurn === publicKey);
+  const onChainPayoutProcessed = Boolean(onChainGame?.payout_processed);
+  const onChainPotStroops = toBigIntSafe(onChainGame?.player1_points) + toBigIntSafe(onChainGame?.player2_points);
+  const onChainRewardWinner = Boolean(
+    isOnChainMultiplayerMode()
+    && matchType === 'wager'
+    && publicKey
+    && onChainWinner
+    && onChainWinner === publicKey,
+  );
+  const myPendingAttackKey =
+    isOnChainMultiplayerMode()
+    && publicKey
+    && onChainPendingAttacker === publicKey
+    && typeof onChainPendingX === 'number'
+    && typeof onChainPendingY === 'number'
+      ? `${onChainPendingX},${onChainPendingY}`
+      : null;
 
   useEffect(() => {
     if (screen !== 'battle') return;
@@ -1162,7 +1584,18 @@ export function BattleshipGame() {
         const pendingY = optionValue<number>(game.pending_y);
         const turn = optionValue<string>(game.turn);
         if (pendingDefender === publicKey && typeof pendingX === 'number' && typeof pendingY === 'number') {
-          setChainStatus(`Incoming attack at (${pendingX}, ${pendingY}). Resolve it to continue.`);
+          setChainStatus(`Incoming attack at (${pendingX}, ${pendingY}). Auto-resolving...`);
+          if (!autoResolveInFlightRef.current) {
+            autoResolveInFlightRef.current = true;
+            try {
+              await resolvePendingAttackIfNeeded(game, publicKey);
+              if (!cancelled) {
+                await refreshOnChainGame(publicKey);
+              }
+            } finally {
+              autoResolveInFlightRef.current = false;
+            }
+          }
         } else if (pendingDefender && pendingDefender !== publicKey) {
           setChainStatus('Waiting for defender to resolve pending attack...');
         } else if (turn === publicKey) {
@@ -1183,7 +1616,13 @@ export function BattleshipGame() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [screen, onChainEnabled, mode, battleshipService, publicKey, sessionId, boardSecrets]);
+  }, [screen, onChainEnabled, mode, battleshipService, publicKey, sessionId, boardSecrets, sessionSigner]);
+
+  useEffect(() => {
+    if (!onChainRewardWinner) return;
+    if (screen !== 'battle') return;
+    setShowRewardModal(true);
+  }, [onChainRewardWinner, screen]);
 
   useEffect(() => {
     if (!onChainEnabled || mode === 'solo' || !battleshipService) {
@@ -1209,6 +1648,121 @@ export function BattleshipGame() {
       cancelled = true;
     };
   }, [onChainEnabled, mode, battleshipService]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (rehydratedRef.current) return;
+    if (!publicKey || !config.battleshipId) return;
+
+    const inviteToken = new URL(window.location.href).searchParams.get('invite') || '';
+    if (inviteToken) {
+      rehydratedRef.current = true;
+      return;
+    }
+
+    const raw = window.localStorage.getItem(BATTLE_PERSIST_KEY);
+    if (!raw) {
+      rehydratedRef.current = true;
+      return;
+    }
+
+    try {
+      const saved = JSON.parse(raw) as PersistedBattleState;
+      if (saved.version !== 1 || saved.contractId !== config.battleshipId || saved.owner !== publicKey) {
+        rehydratedRef.current = true;
+        return;
+      }
+
+      setMode(saved.mode);
+      setOnChainEnabled(saved.onChainEnabled);
+      setSessionId(saved.sessionId);
+      setFleetPreset(saved.fleetPreset);
+      setFleetBlueprint(FLEET_PRESETS[saved.fleetPreset].ships);
+      setTheme(saved.theme);
+      setDifficulty(saved.difficulty);
+      setMatchType(saved.matchType);
+      setBoardScale(saved.boardScale);
+      setPlayer1Points(saved.player1Points);
+      setPlayer2Points(saved.player2Points);
+      setPlayer2Address(saved.player2Address);
+      setShips(saved.ships);
+      setBoardCommitted(saved.boardCommitted);
+      setBoardSecrets(deserializeBoardSecrets(saved.boardSecrets));
+
+      if (saved.sessionSignerSecret) {
+        try {
+          setSessionSigner(createSessionKeySignerFromSecret(saved.sessionSignerSecret));
+        } catch {
+          setSessionSigner(null);
+        }
+      }
+
+      if (saved.screen === 'battle' || saved.screen === 'placement' || saved.screen === 'setup') {
+        setScreen(saved.screen);
+        setSuccess('Restored your active on-chain match after reload.');
+      }
+    } catch {
+      clearPersistedBattleState();
+    } finally {
+      rehydratedRef.current = true;
+    }
+  }, [publicKey]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (!publicKey || !config.battleshipId) return;
+
+    const shouldPersist = onChainEnabled
+      && mode !== 'solo'
+      && (screen === 'setup' || screen === 'placement' || screen === 'battle');
+
+    if (!shouldPersist) {
+      clearPersistedBattleState();
+      return;
+    }
+
+    const payload: PersistedBattleState = {
+      version: 1,
+      contractId: config.battleshipId,
+      owner: publicKey,
+      mode,
+      screen,
+      onChainEnabled,
+      sessionId,
+      fleetPreset,
+      theme,
+      difficulty,
+      matchType,
+      boardScale,
+      player1Points,
+      player2Points,
+      player2Address,
+      ships,
+      boardCommitted,
+      boardSecrets: serializeBoardSecrets(boardSecrets),
+      sessionSignerSecret: sessionSigner?.secret || null,
+    };
+
+    window.localStorage.setItem(BATTLE_PERSIST_KEY, JSON.stringify(payload));
+  }, [
+    publicKey,
+    mode,
+    screen,
+    onChainEnabled,
+    sessionId,
+    fleetPreset,
+    theme,
+    difficulty,
+    matchType,
+    boardScale,
+    player1Points,
+    player2Points,
+    player2Address,
+    ships,
+    boardCommitted,
+    boardSecrets,
+    sessionSigner,
+  ]);
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -1240,14 +1794,109 @@ export function BattleshipGame() {
     setOnChainEnabled(Boolean(parsed.signedAuthEntryXdr && parsed.contractId));
     setScreen('setup');
     setError(null);
-    setSuccess('Invite loaded. Configure your playground and continue.');
+    setSuccess('Invite loaded. Joining match automatically...');
   }, []);
+
+  useEffect(() => {
+    if (screen !== 'setup' || mode !== 'join') return;
+    if (!loadedInvitePayload) return;
+    if (autoJoinAttemptedRef.current) return;
+
+    if (onChainEnabled && (!isConnected || !publicKey)) {
+      setChainStatus(AUTO_JOIN_CONNECT_WALLET_STATUS);
+      return;
+    }
+
+    setChainStatus((prev) => (prev === AUTO_JOIN_CONNECT_WALLET_STATUS ? null : prev));
+
+    autoJoinAttemptedRef.current = true;
+    setIsAutoJoiningInvite(true);
+    void (async () => {
+      try {
+        await continueFromSetup();
+      } finally {
+        setIsAutoJoiningInvite(false);
+      }
+    })();
+  }, [screen, mode, loadedInvitePayload, onChainEnabled, isConnected, publicKey]);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+
+    const onHashChange = () => {
+      const next = getRouteStateFromHash();
+      setScreen((prev) => (prev === next.screen ? prev : next.screen));
+      if (typeof next.sessionId === 'number') {
+        const parsedSessionId = next.sessionId;
+        setSessionId((prev) => (prev === parsedSessionId ? prev : parsedSessionId));
+      }
+    };
+
+    window.addEventListener('hashchange', onHashChange);
+
+    if (!window.location.hash) {
+      window.history.replaceState(null, '', hashForScreen(screen, sessionId));
+    }
+
+    return () => {
+      window.removeEventListener('hashchange', onHashChange);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const includeSessionInPath = onChainEnabled && mode !== 'solo' && (screen === 'placement' || screen === 'battle');
+    const nextHash = hashForScreen(screen, sessionId, includeSessionInPath);
+    if (window.location.hash !== nextHash) {
+      window.history.replaceState(null, '', nextHash);
+    }
+  }, [screen, sessionId, onChainEnabled, mode]);
 
   useEffect(() => {
     if (!publicKey) {
       setSessionSigner(null);
     }
   }, [publicKey]);
+
+  useEffect(() => {
+    if (screen !== 'placement' && screen !== 'battle') return;
+    if (!onChainEnabled || mode === 'solo') return;
+    if (!battleshipService) return;
+    if (!publicKey) {
+      setError('Connect wallet to access this game endpoint.');
+      setScreen('setup');
+      return;
+    }
+
+    let cancelled = false;
+    void (async () => {
+      try {
+        const game = await battleshipService.getGame(sessionId);
+        if (cancelled) return;
+        if (!game) {
+          setError('Invalid game endpoint. Session not found on-chain.');
+          setScreen('home');
+          return;
+        }
+
+        const isParticipant = game.player1 === publicKey || game.player2 === publicKey;
+        if (!isParticipant) {
+          setError('This game endpoint is signed for different players. Connect the invited wallet.');
+          setScreen('home');
+          return;
+        }
+      } catch {
+        if (!cancelled) {
+          setError('Could not validate this game endpoint right now. Please retry.');
+          setScreen('setup');
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [screen, onChainEnabled, mode, battleshipService, publicKey, sessionId]);
 
   const LOGO = `
 ██████   █████  ████████ ████████ ██      ███████ ███████ ██   ██ ██ ██████  
@@ -1307,6 +1956,8 @@ export function BattleshipGame() {
   }
 
   if (screen === 'setup') {
+    const joinFromInvite = mode === 'join' && Boolean(loadedInvitePayload);
+
     return (
       <div className={`classic-shell ${themeClass}`} style={shellStyle}>
         <div className="home-shell" style={{ display: 'grid', gap: 16 }}>
@@ -1323,6 +1974,23 @@ export function BattleshipGame() {
 
           <WalletSwitcher />
 
+          {joinFromInvite && (
+            <div className="card auto-join-card">
+              <div className="auto-join-title">Instant Invite Join</div>
+              <div className="inline-hint">
+                {isAutoJoiningInvite || isSyncingChain
+                  ? 'Joining your match on-chain, preparing stake flow, and moving you to battle setup...'
+                  : 'Invite loaded. Auto-join is ready.'}
+              </div>
+              {(isAutoJoiningInvite || isSyncingChain) && (
+                <div className="auto-join-loader" aria-live="polite">
+                  <span className="auto-join-dot" />
+                  <span>{chainStatus || 'Processing invite...'}</span>
+                </div>
+              )}
+            </div>
+          )}
+
           <div className="grid-2">
             <div className="card stack">
               <div className="section-title">Match settings</div>
@@ -1331,6 +1999,7 @@ export function BattleshipGame() {
                   <label>Mode</label>
                   <select
                     value={mode}
+                    disabled={joinFromInvite}
                     onChange={(e) => {
                       const nextMode = e.target.value as Mode;
                       setMode(nextMode);
@@ -1344,7 +2013,7 @@ export function BattleshipGame() {
                 </div>
                 <div className="setup-block">
                   <label>Difficulty</label>
-                  <select value={difficulty} onChange={(e) => setDifficulty(e.target.value as Difficulty)}>
+                  <select value={difficulty} disabled={joinFromInvite} onChange={(e) => setDifficulty(e.target.value as Difficulty)}>
                     <option value="easy">Easy</option>
                     <option value="normal">Normal</option>
                     <option value="hard">Hard</option>
@@ -1352,14 +2021,29 @@ export function BattleshipGame() {
                 </div>
                 <div className="setup-block">
                   <label>Match type</label>
-                  <select value={matchType} onChange={(e) => setMatchType(e.target.value as MatchType)}>
+                  <select
+                    value={matchType}
+                    disabled={joinFromInvite}
+                    onChange={(e) => {
+                      const nextMatchType = e.target.value as MatchType;
+                      if (nextMatchType === 'wager' && mode !== 'solo' && onChainEnabled && !betTokenContract) {
+                        setError('Wager is not available yet because XLM staking is not configured on-chain.');
+                        setMatchType('free');
+                        return;
+                      }
+                      setMatchType(nextMatchType);
+                    }}
+                  >
                     <option value="free">Free play</option>
-                    <option value="wager">Wager match</option>
+                    <option value="wager" disabled={mode !== 'solo' && onChainEnabled && !betTokenContract}>Wager match</option>
                   </select>
+                  {mode !== 'solo' && onChainEnabled && !betTokenContract && (
+                    <div className="inline-hint">Wager disabled: admin must configure native XLM staking on-chain (`prover:set-bet-token`).</div>
+                  )}
                 </div>
                 <div className="setup-block">
                   <label>Playground size</label>
-                  <select value={boardScale} onChange={(e) => setBoardScale(e.target.value as BoardScale)}>
+                  <select value={boardScale} disabled={joinFromInvite} onChange={(e) => setBoardScale(e.target.value as BoardScale)}>
                     <option value="compact">Compact</option>
                     <option value="standard">Standard</option>
                     <option value="large">Large</option>
@@ -1370,6 +2054,7 @@ export function BattleshipGame() {
                     <label>Settlement</label>
                     <select
                       value={onChainEnabled ? 'onchain' : 'offchain'}
+                      disabled={joinFromInvite}
                       onChange={(e) => setOnChainEnabled(e.target.value === 'onchain')}
                     >
                       <option value="onchain">On-chain (Soroban)</option>
@@ -1400,7 +2085,8 @@ export function BattleshipGame() {
               {mode !== 'solo' && onChainEnabled && !config.battleshipId && (
                 <div className="notice error">Contract ID missing. Run setup/deploy to enable on-chain mode.</div>
               )}
-              {mode !== 'solo' && onChainEnabled && chainStatus && (
+              {mode !== 'solo' && onChainEnabled && chainStatus
+                && (chainStatus !== AUTO_JOIN_CONNECT_WALLET_STATUS || !isConnected || !publicKey) && (
                 <div className="notice success">{chainStatus}</div>
               )}
 
@@ -1428,14 +2114,14 @@ export function BattleshipGame() {
                 <div className="inline-hint">Free play selected — no stake required.</div>
               )}
 
-              {mode !== 'solo' && (
+              {mode !== 'solo' && !joinFromInvite && (
                 <div className="stack" style={{ marginTop: 12 }}>
                   <label>Opponent address</label>
                   <input value={player2Address} onChange={(e) => setPlayer2Address(e.target.value.trim())} placeholder="Enter wallet / player ID" />
                 </div>
               )}
 
-              {mode === 'join' && (
+              {mode === 'join' && !joinFromInvite && (
                 <div className="stack" style={{ marginTop: 12 }}>
                   <label>Invite link or XDR</label>
                   <input
@@ -1447,6 +2133,12 @@ export function BattleshipGame() {
                     <button className="ghost" onClick={loadInviteSettings}>Load invite settings</button>
                   </div>
                   <div className="inline-hint">Loads mode, stakes, fleet preset, theme, difficulty and board size from invite.</div>
+                </div>
+              )}
+
+              {joinFromInvite && (
+                <div className="notice info" style={{ marginTop: 12 }}>
+                  Invite detected from URL. Joining is automatic — no manual copy/paste or setting changes needed.
                 </div>
               )}
 
@@ -1510,12 +2202,14 @@ export function BattleshipGame() {
 
           <div className="actions" style={{ marginTop: 16 }}>
             <button className="ghost" onClick={() => goHome()}>Cancel</button>
-            <button
-              disabled={isSyncingChain || (mode === 'join' ? (!importXdr && !loadedInvitePayload) : mode === 'invite' ? !player2Address : false)}
-              onClick={continueFromSetup}
-            >
-              {isSyncingChain ? 'Syncing on-chain...' : 'Continue to placement'}
-            </button>
+            {!joinFromInvite && (
+              <button
+                disabled={isSyncingChain || (mode === 'join' ? (!importXdr && !loadedInvitePayload) : mode === 'invite' ? !player2Address : false)}
+                onClick={continueFromSetup}
+              >
+                {isSyncingChain ? 'Syncing on-chain...' : 'Continue to placement'}
+              </button>
+            )}
           </div>
 
           {error && <div className="notice error">{error}</div>}
@@ -1631,10 +2325,22 @@ export function BattleshipGame() {
               <div className="placement_instructions" style={{ gap: 10 }}>
                 <div className="inline-hint">Placed ships: {ships.filter((s) => s.x !== null).length} / {ships.length}</div>
                 {isOnChainMultiplayerMode() && (
-                  <div className="inline-hint">{boardCommitted ? 'Board committed on-chain.' : 'Start will commit your board to Soroban first.'}</div>
+                  <div className="inline-hint">
+                    {boardCommitted
+                      ? 'Board committed on-chain.'
+                      : matchType === 'wager'
+                        ? 'Start will first deposit your stake (if pending), then commit your board to Soroban.'
+                        : 'Start will commit your board to Soroban first.'}
+                  </div>
                 )}
                 <button disabled={!allPlaced() || isSyncingChain} onClick={startBattle} className="btn-primary btn-start">
-                  {isOnChainMultiplayerMode() ? (isSyncingChain ? 'Syncing chain...' : 'Commit & Start') : 'Start Game'}
+                  {isOnChainMultiplayerMode()
+                    ? (isSyncingChain
+                      ? 'Syncing chain...'
+                      : matchType === 'wager'
+                        ? 'Stake, Commit & Start'
+                        : 'Commit & Start')
+                    : 'Start Game'}
                 </button>
               </div>
             </div>
@@ -1678,9 +2384,14 @@ export function BattleshipGame() {
           <span>Difficulty: {difficulty}</span>
           <span>Rule: {matchType === 'wager' ? `Wager (${totalStake.toFixed(2)} XLM)` : 'Free play'}</span>
           {isOnChainMultiplayerMode() && <span>Settlement: On-chain</span>}
+          {isOnChainMultiplayerMode() && matchType === 'wager' && <span>Payout: {onChainPayoutProcessed ? 'Processed' : 'Pending'}</span>}
           <span>Fleet Ready: {ships.filter((s) => s.x !== null).length}/{ships.length}</span>
           <span>Hits taken: {hitsPlayer.size}</span>
         </div>
+
+        {lastRewardClaimText && (
+          <div className="notice success">{lastRewardClaimText}</div>
+        )}
 
         {isOnChainMultiplayerMode() && chainStatus && <div className="notice success">{chainStatus}</div>}
 
@@ -1703,29 +2414,6 @@ export function BattleshipGame() {
           </div>
         )}
 
-        {isOnChainMultiplayerMode()
-          && onChainGame
-          && publicKey
-          && onChainPendingDefender === publicKey
-          && typeof onChainPendingX === 'number'
-          && typeof onChainPendingY === 'number' && (
-          <div className="card" style={{ display: 'grid', gap: 10 }}>
-            <div className="inline-hint">
-              Incoming attack at ({onChainPendingX}, {onChainPendingY}) needs your resolution before the next turn.
-            </div>
-            <button
-              className="btn-primary"
-              disabled={isSyncingChain}
-              onClick={async () => {
-                await resolvePendingAttackIfNeeded(onChainGame, publicKey);
-                await refreshOnChainGame(publicKey);
-              }}
-            >
-              {isSyncingChain ? 'Resolving on-chain...' : 'Resolve Incoming Attack'}
-            </button>
-          </div>
-        )}
-
         {(enemyDefeated || playerDefeated) && (
           <div className="result-view card">
             <h3 className="accent-color">{enemyDefeated ? 'Victory' : 'Defeat'}</h3>
@@ -1734,9 +2422,34 @@ export function BattleshipGame() {
                 ? 'You successfully discovered and destroyed all enemy ships.'
                 : 'Your fleet has been fully destroyed. Reconfigure and try again.'}
             </p>
+            {isOnChainMultiplayerMode() && matchType === 'wager' && (
+              <p className="inline-hint">Wager pot: {formatXlmFromStroops(onChainPotStroops)} XLM</p>
+            )}
             <div className="result-actions">
               <button className="btn-secondary" onClick={() => startPlacement(mode)}>Play Again</button>
               <button onClick={goHome}>Back Home</button>
+            </div>
+          </div>
+        )}
+
+        {showRewardModal && onChainRewardWinner && (
+          <div className="handoff-overlay" role="dialog" aria-modal="true">
+            <div className="handoff-card">
+              <h3 className="accent-color">Victory Reward</h3>
+              <p className="inline-hint">You won this on-chain wager match.</p>
+              <p className="inline-hint">Total pot: {formatXlmFromStroops(onChainPotStroops)} XLM</p>
+              <div className="result-actions" style={{ marginTop: 6 }}>
+                <button
+                  className="btn-primary"
+                  disabled={isRewardClaiming}
+                  onClick={claimWinnerReward}
+                >
+                  {isRewardClaiming ? 'Checking on-chain reward...' : 'Get Reward'}
+                </button>
+                <button className="btn-secondary" onClick={() => setShowRewardModal(false)}>
+                  Later
+                </button>
+              </div>
             </div>
           </div>
         )}
@@ -1768,10 +2481,11 @@ export function BattleshipGame() {
                 const wasShot = enemyShots.has(key);
                 const isHit = enemyHits.has(key);
                 const isSunk = isHit && enemyMask[y][x];
+                const isPendingAttack = myPendingAttackKey === key && !wasShot;
                 return (
                   <div
                     key={idx}
-                    className={`board_box ${isHit ? 'hit' : ''} ${wasShot && !isHit ? 'miss' : ''} ${isSunk ? 'selected' : ''}`}
+                    className={`board_box ${isHit ? 'hit' : ''} ${wasShot && !isHit ? 'miss' : ''} ${isSunk ? 'selected' : ''} ${isPendingAttack ? 'pending' : ''}`}
                     onClick={async () => {
                       if (enemyDefeated || playerDefeated) return;
                       await fireAtEnemy(x, y);
@@ -1779,7 +2493,9 @@ export function BattleshipGame() {
                         enemyFires();
                       }
                     }}
-                  />
+                  >
+                    {isPendingAttack ? <span className="board_box-marker">…</span> : null}
+                  </div>
                 );
               })}
             </div>

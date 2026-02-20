@@ -8,31 +8,165 @@ import { injectSignedAuthEntry } from '@/utils/authEntryUtils';
 
 type ClientOptions = contract.ClientOptions;
 
-function normalizeAuthSignatureBytes(signedAuthEntryBase64: string): Buffer {
-  const raw = Buffer.from(signedAuthEntryBase64, 'base64');
-  if (raw.length === 64) return raw;
-
-  try {
-    const entry = xdr.SorobanAuthorizationEntry.fromXDR(signedAuthEntryBase64, 'base64');
-    const credentials = entry.credentials();
-    if (credentials.switch().name !== 'sorobanCredentialsAddress') {
-      throw new Error('Auth entry credentials are not address-based.');
-    }
-
-    const signature = credentials.address().signature();
-    if (signature.switch().name !== 'scvBytes') {
-      throw new Error('Signed auth entry does not include bytes signature.');
-    }
-
-    const sigBytes = Buffer.from(signature.bytes());
-    if (sigBytes.length !== 64) {
-      throw new Error(`Signature must be 64 bytes, got ${sigBytes.length}.`);
-    }
-
-    return sigBytes;
-  } catch {
-    throw new Error('Invalid auth-entry signing response. Expected 64-byte signature or signed auth-entry XDR.');
+function summarizeAuthPayload(value: unknown): string {
+  if (typeof value === 'string') return `string(len=${value.length})`;
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) return `bytes(len=${value.length})`;
+  if (value && typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>).slice(0, 8);
+    return `object(keys=${keys.join(',') || 'none'})`;
   }
+  return String(value);
+}
+
+function summarizeSignResult(signResult: unknown): Record<string, string> {
+  if (!signResult || typeof signResult !== 'object') {
+    return { result: summarizeAuthPayload(signResult) };
+  }
+
+  const record = signResult as Record<string, unknown>;
+  return {
+    result: summarizeAuthPayload(signResult),
+    signedAuthEntry: summarizeAuthPayload(record.signedAuthEntry),
+    signed_auth_entry: summarizeAuthPayload(record.signed_auth_entry),
+    signature: summarizeAuthPayload(record.signature),
+    sig: summarizeAuthPayload(record.sig),
+    xdr: summarizeAuthPayload(record.xdr),
+    signerAddress: summarizeAuthPayload(record.signerAddress),
+    error: summarizeAuthPayload(record.error),
+  };
+}
+
+function summarizePreimage(preimageXdrBase64: string): Record<string, string | number> {
+  try {
+    const parsed = xdr.HashIdPreimage.fromXDR(preimageXdrBase64, 'base64');
+    const preimageType = parsed.switch().name;
+
+    if (preimageType !== 'envelopeTypeSorobanAuthorization') {
+      return {
+        parse: 'ok',
+        preimageType,
+        preimageLen: preimageXdrBase64.length,
+      };
+    }
+
+    const auth = parsed.sorobanAuthorization();
+    return {
+      parse: 'ok',
+      preimageType,
+      preimageLen: preimageXdrBase64.length,
+      invocationType: auth.invocation().function().switch().name,
+      signatureExpirationLedger: Number(auth.signatureExpirationLedger().toString()),
+    };
+  } catch (error) {
+    return {
+      parse: 'failed',
+      preimageLen: preimageXdrBase64.length,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function normalizeAuthSignatureBytes(signedAuthEntryValue: unknown): Buffer {
+  const firstNonEmptyString = (values: Array<unknown>): string | undefined => {
+    for (const value of values) {
+      if (typeof value !== 'string') continue;
+      const trimmed = value.trim();
+      if (trimmed.length > 0) return trimmed;
+    }
+    return undefined;
+  };
+
+  const fromAuthEntryXdr = (value: string | Buffer, format: 'base64' | 'raw'): Buffer | null => {
+    try {
+      const entry = format === 'raw'
+        ? xdr.SorobanAuthorizationEntry.fromXDR(
+          typeof value === 'string' ? Buffer.from(value, 'base64') : value,
+          'raw',
+        )
+        : (typeof value === 'string'
+          ? xdr.SorobanAuthorizationEntry.fromXDR(value, 'base64')
+          : null);
+      if (!entry) return null;
+      const credentials = entry.credentials();
+      if (credentials.switch().name !== 'sorobanCredentialsAddress') return null;
+
+      const signature = credentials.address().signature();
+      if (signature.switch().name !== 'scvBytes') return null;
+
+      const sigBytes = Buffer.from(signature.bytes());
+      return sigBytes.length === 64 ? sigBytes : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const unwrapCandidate = (value: unknown): unknown => {
+    if (Buffer.isBuffer(value) || value instanceof Uint8Array) return value;
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return trimmed;
+      try {
+        const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+        return firstNonEmptyString([
+          parsed.signedAuthEntry,
+          parsed.signature,
+          parsed.signed_auth_entry,
+          parsed.sig,
+          parsed.xdr,
+        ]) ?? trimmed;
+      } catch {
+        return trimmed;
+      }
+    }
+    if (value && typeof value === 'object') {
+      const record = value as Record<string, unknown>;
+      return firstNonEmptyString([
+        record.signedAuthEntry,
+        record.signature,
+        record.signed_auth_entry,
+        record.sig,
+        record.xdr,
+      ]) ?? value;
+    }
+    return value;
+  };
+
+  const candidate = unwrapCandidate(signedAuthEntryValue);
+
+  if (Buffer.isBuffer(candidate) || candidate instanceof Uint8Array) {
+    const raw = Buffer.from(candidate);
+    if (raw.length === 64) return raw;
+    const parsed = fromAuthEntryXdr(raw, 'raw');
+    if (parsed) return parsed;
+  }
+
+  if (typeof candidate === 'string') {
+    const withNoHexPrefix = candidate.startsWith('0x') ? candidate.slice(2) : candidate;
+
+    if (/^[0-9a-fA-F]{128}$/.test(withNoHexPrefix)) {
+      const hexBytes = Buffer.from(withNoHexPrefix, 'hex');
+      if (hexBytes.length === 64) return hexBytes;
+    }
+
+    const normalizedBase64 = withNoHexPrefix.replace(/-/g, '+').replace(/_/g, '/');
+    const paddedBase64 = normalizedBase64 + '='.repeat((4 - (normalizedBase64.length % 4)) % 4);
+    const decoded = Buffer.from(paddedBase64, 'base64');
+    if (decoded.length === 64) return decoded;
+
+    const parsedBase64 = fromAuthEntryXdr(paddedBase64, 'base64');
+    if (parsedBase64) return parsedBase64;
+
+    const parsedRaw = fromAuthEntryXdr(decoded, 'raw');
+    if (parsedRaw) return parsedRaw;
+  }
+
+  const candidateDetail = summarizeAuthPayload(candidate);
+  const originalDetail = summarizeAuthPayload(signedAuthEntryValue);
+  console.error('[auth-normalize] Invalid auth-entry signing response', {
+    candidateDetail,
+    originalDetail,
+  });
+  throw new Error(`Invalid auth-entry signing response. Expected 64-byte signature or signed auth-entry XDR. Received ${candidateDetail}. Original payload: ${originalDetail}.`);
 }
 
 /**
@@ -223,18 +357,22 @@ export class BattleshipService {
         // The preimage is what needs to be signed
         // Call wallet to sign the preimage hash
         console.log('[prepareStartGame] Signing preimage with wallet...');
+        const preimageXdr = preimage.toXDR('base64');
+        console.log('[prepareStartGame] Preimage diagnostics:', summarizePreimage(preimageXdr));
 
         if (!player1Signer.signAuthEntry) {
           throw new Error('Wallet does not support auth entry signing');
         }
 
         const signResult = await player1Signer.signAuthEntry(
-          preimage.toXDR('base64'),  // Preimage as base64 XDR
+          preimageXdr,  // Preimage as base64 XDR
           {
             networkPassphrase: NETWORK_PASSPHRASE,
             address: player1,
           }
         );
+
+        console.log('[prepareStartGame] Wallet signAuthEntry result meta:', summarizeSignResult(signResult));
 
         if (signResult.error) {
           throw new Error(`Failed to sign auth entry: ${signResult.error.message}`);
@@ -243,7 +381,7 @@ export class BattleshipService {
         console.log('[prepareStartGame] Got signature from wallet');
 
         // Return signature as Buffer (authorizeEntry expects a Buffer)
-        return normalizeAuthSignatureBytes(signResult.signedAuthEntry);
+        return normalizeAuthSignatureBytes(signResult.signedAuthEntry || (signResult as unknown));
       },
       validUntilLedgerSeq,  // Signature expiration ledger
       NETWORK_PASSPHRASE,
@@ -679,7 +817,14 @@ export class BattleshipService {
     delegateAddress?: string,
     authTtlMinutes?: number
   ) {
-    const client = this.createSigningClient(attackerAddress, signer);
+    const sourceAddress = delegateAddress || attackerAddress;
+    const client = this.createSigningClient(sourceAddress, signer);
+    console.log('[session-delegation] submitAttack source selection', {
+      sessionId,
+      attacker: attackerAddress,
+      delegate: delegateAddress,
+      source: sourceAddress,
+    });
     if (delegateAddress && typeof (client as any).attack_by_session !== 'function') {
       throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
     }
@@ -721,7 +866,14 @@ export class BattleshipService {
     delegateAddress?: string,
     authTtlMinutes?: number
   ) {
-    const client = this.createSigningClient(defenderAddress, signer);
+    const sourceAddress = delegateAddress || defenderAddress;
+    const client = this.createSigningClient(sourceAddress, signer);
+    console.log('[session-delegation] resolveAttack source selection', {
+      sessionId,
+      defender: defenderAddress,
+      delegate: delegateAddress,
+      source: sourceAddress,
+    });
     if (delegateAddress && typeof (client as any).resolve_attack_by_session !== 'function') {
       throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
     }
@@ -770,7 +922,14 @@ export class BattleshipService {
     delegateAddress?: string,
     authTtlMinutes?: number
   ) {
-    const client = this.createSigningClient(defenderAddress, signer);
+    const sourceAddress = delegateAddress || defenderAddress;
+    const client = this.createSigningClient(sourceAddress, signer);
+    console.log('[session-delegation] resolveAttackZk source selection', {
+      sessionId,
+      defender: defenderAddress,
+      delegate: delegateAddress,
+      source: sourceAddress,
+    });
     if (delegateAddress && typeof (client as any).resolve_attack_zk_by_session !== 'function') {
       throw new Error('Contract bindings are outdated. Regenerate bindings after deploying session delegation contract update.');
     }
@@ -954,6 +1113,16 @@ export class BattleshipService {
       return result.result;
     } catch {
       return undefined;
+    }
+  }
+
+  async getFeeBps(): Promise<number> {
+    try {
+      const tx = await this.baseClient.get_fee_bps();
+      const result = await tx.simulate();
+      return Number(result.result ?? 0);
+    } catch {
+      return 0;
     }
   }
 
