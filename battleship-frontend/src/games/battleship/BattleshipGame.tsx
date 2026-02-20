@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import './classic.css';
 import { Buffer } from 'buffer';
 import { keccak_256 } from 'js-sha3';
+import { Keypair, TransactionBuilder, hash } from '@stellar/stellar-sdk';
 import { WalletSwitcher } from '@/components/WalletSwitcher';
 import { useWallet } from '@/hooks/useWallet';
 import { config } from '@/config';
@@ -131,7 +132,13 @@ interface PersistedBattleState {
   ships: ShipPlacement[];
   boardCommitted: boolean;
   boardSecrets: PersistedCellSecret[] | null;
+  aiBoardSecrets: PersistedCellSecret[] | null;
   sessionSignerSecret: string | null;
+}
+
+interface LocalContractSigner {
+  signTransaction: (txXdr: string, opts?: { networkPassphrase?: string }) => Promise<{ signedTxXdr: string; signerAddress: string }>;
+  signAuthEntry: (preimageXdr: string) => Promise<{ signedAuthEntry: string; signerAddress: string }>;
 }
 
 const AUTO_JOIN_CONNECT_WALLET_STATUS = 'Connect your wallet to auto-join this invite.';
@@ -180,6 +187,7 @@ function hashForScreen(screen: Screen, sessionId?: number, includeSessionInPath 
 export function BattleshipGame() {
   const autoJoinAttemptedRef = useRef(false);
   const autoResolveInFlightRef = useRef(false);
+  const aiActionInFlightRef = useRef(false);
   const rehydratedRef = useRef(false);
   const [fleetPreset, setFleetPreset] = useState<FleetPreset>('classic');
   const [fleetBlueprint, setFleetBlueprint] = useState(FLEET_PRESETS.classic.ships);
@@ -206,6 +214,7 @@ export function BattleshipGame() {
   const [zkVerifierContract, setZkVerifierContract] = useState<string | undefined>(undefined);
   const [betTokenContract, setBetTokenContract] = useState<string | undefined>(undefined);
   const [boardSecrets, setBoardSecrets] = useState<LocalCellSecret[] | null>(null);
+  const [aiBoardSecrets, setAiBoardSecrets] = useState<LocalCellSecret[] | null>(null);
   const [boardCommitted, setBoardCommitted] = useState(false);
   const [sessionSigner, setSessionSigner] = useState<SessionKeySigner | null>(null);
   const [isAutoJoiningInvite, setIsAutoJoiningInvite] = useState(false);
@@ -445,11 +454,50 @@ export function BattleshipGame() {
     setOnChainGame(null);
     setBoardCommitted(false);
     setBoardSecrets(null);
+    setAiBoardSecrets(null);
     setSessionSigner(null);
   }
 
-  function isOnChainMultiplayerMode() {
-    return onChainEnabled && mode !== 'solo';
+  function isOnChainGameMode() {
+    return onChainEnabled;
+  }
+
+  function getSoloAiSecret() {
+    const secret = import.meta.env.VITE_DEV_PLAYER2_SECRET || '';
+    if (!secret || secret === 'NOT_AVAILABLE') return undefined;
+    return secret;
+  }
+
+  function getSoloAiAddress() {
+    const secret = getSoloAiSecret();
+    if (!secret) return undefined;
+    try {
+      return Keypair.fromSecret(secret).publicKey();
+    } catch {
+      return undefined;
+    }
+  }
+
+  function createLocalSignerFromSecret(secret: string): LocalContractSigner {
+    const keypair = Keypair.fromSecret(secret);
+    const signerAddress = keypair.publicKey();
+
+    return {
+      signTransaction: async (txXdr: string, opts?: { networkPassphrase?: string }) => {
+        const tx = TransactionBuilder.fromXDR(txXdr, opts?.networkPassphrase || config.networkPassphrase);
+        tx.sign(keypair);
+        return { signedTxXdr: tx.toXDR(), signerAddress };
+      },
+      signAuthEntry: async (preimageXdr: string) => {
+        const preimageBytes = Buffer.from(preimageXdr, 'base64');
+        const payload = hash(preimageBytes);
+        const signatureBytes = keypair.sign(payload);
+        return {
+          signedAuthEntry: Buffer.from(signatureBytes).toString('base64'),
+          signerAddress,
+        };
+      },
+    };
   }
 
   function toBoardIndex(x: number, y: number) {
@@ -1022,7 +1070,7 @@ export function BattleshipGame() {
   }
 
   function canProceedFromSetup() {
-    if (mode !== 'solo' && onChainEnabled && matchType === 'wager' && !betTokenContract) {
+    if (onChainEnabled && matchType === 'wager' && !betTokenContract) {
       setError('Wager is unavailable: XLM staking is not configured on this Battleship contract. Admin must run prover:set-bet-token.');
       return false;
     }
@@ -1048,6 +1096,75 @@ export function BattleshipGame() {
       return false;
     }
     return true;
+  }
+
+  async function startSoloOnChainSession() {
+    if (!battleshipService || !config.battleshipId) {
+      setError('Battleship contract is not configured. Run setup/deploy first.');
+      return false;
+    }
+    if (!isConnected || !publicKey) {
+      setError('Connect wallet first to start solo on-chain mode.');
+      return false;
+    }
+
+    const aiSecret = getSoloAiSecret();
+    const aiAddress = getSoloAiAddress();
+    if (!aiSecret || !aiAddress) {
+      setError('Solo AI signer is not configured. Run bun run setup to populate VITE_DEV_PLAYER2_SECRET.');
+      return false;
+    }
+    if (aiAddress === publicKey) {
+      setError('Solo AI wallet must differ from your connected wallet.');
+      return false;
+    }
+
+    const myStake = matchType === 'wager' ? toStroops(player1Points) : 0n;
+    const aiStake = matchType === 'wager' ? myStake : 0n;
+    if (matchType === 'wager' && myStake <= 0n) {
+      setError('Enter a valid positive stake for solo on-chain wager mode.');
+      return false;
+    }
+
+    try {
+      setIsSyncingChain(true);
+      setChainStatus('Preparing solo on-chain session authorization...');
+      const playerSigner = getContractSigner();
+      const aiSigner = createLocalSignerFromSecret(aiSecret);
+
+      const signedAuthEntryXdr = await battleshipService.prepareStartGame(
+        sessionId,
+        publicKey,
+        aiAddress,
+        myStake,
+        aiStake,
+        playerSigner,
+      );
+
+      setChainStatus('Finalizing on-chain solo start with AI signer...');
+      const txXdr = await battleshipService.importAndSignAuthEntry(
+        signedAuthEntryXdr,
+        aiAddress,
+        aiStake,
+        aiSigner,
+      );
+      await battleshipService.finalizeStartGame(txXdr, aiAddress, aiSigner);
+
+      setPlayer2Address(aiAddress);
+      if (matchType === 'wager') {
+        setPlayer2Points(player1Points);
+      }
+      setSuccess('Solo on-chain match created. Continue to ship placement.');
+      setChainStatus('On-chain solo match ready.');
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : 'Failed to start on-chain solo match.';
+      setError(message);
+      setChainStatus(null);
+      return false;
+    } finally {
+      setIsSyncingChain(false);
+    }
   }
 
   function hasCurrentInvitePrepared(forceOnChain = onChainEnabled) {
@@ -1083,6 +1200,15 @@ export function BattleshipGame() {
   async function continueFromSetup() {
     setSuccess(null);
     if (!canProceedFromSetup()) return;
+
+    if (mode === 'solo') {
+      if (onChainEnabled) {
+        const started = await startSoloOnChainSession();
+        if (!started) return;
+      }
+      startPlacement(mode);
+      return;
+    }
 
     if (mode === 'invite') {
       const inviteReady = hasCurrentInvitePrepared(onChainEnabled);
@@ -1159,7 +1285,7 @@ export function BattleshipGame() {
 
   function goToSetup(nextMode: Mode) {
     setMode(nextMode);
-    setOnChainEnabled(nextMode !== 'solo');
+    setOnChainEnabled(true);
     if (nextMode === 'join' && !importXdr && typeof window !== 'undefined') {
       const fromUrl = new URL(window.location.href).searchParams.get('invite') || '';
       if (fromUrl) setImportXdr(fromUrl);
@@ -1185,7 +1311,7 @@ export function BattleshipGame() {
       return;
     }
 
-    if (isOnChainMultiplayerMode()) {
+    if (isOnChainGameMode()) {
       if (!battleshipService) {
         setError('Battleship contract service is not configured.');
         return;
@@ -1196,6 +1322,17 @@ export function BattleshipGame() {
       }
 
       try {
+        const soloAiSecret = mode === 'solo' ? getSoloAiSecret() : undefined;
+        const soloAiAddress = mode === 'solo' ? getSoloAiAddress() : undefined;
+        const soloAiSigner = mode === 'solo' && soloAiSecret
+          ? createLocalSignerFromSecret(soloAiSecret)
+          : undefined;
+
+        if (mode === 'solo' && (!soloAiAddress || !soloAiSigner)) {
+          setError('Solo AI signer is not configured. Run bun run setup to populate dev secrets.');
+          return;
+        }
+
         setEnemyFleet([]);
         setHitsPlayer(new Set());
         setEnemyShots(new Set());
@@ -1238,6 +1375,28 @@ export function BattleshipGame() {
             }
           } else {
             setChainStatus('Step 1/3: Stake already deposited. Checking funding state...');
+          }
+
+          if (mode === 'solo' && soloAiAddress && soloAiSigner) {
+            const aiAlreadyDeposited = game.player1 === soloAiAddress
+              ? game.player1_deposited
+              : game.player2 === soloAiAddress
+                ? game.player2_deposited
+                : false;
+
+            if (!aiAlreadyDeposited) {
+              setChainStatus('Step 1/3: Depositing AI stake into on-chain escrow...');
+              try {
+                await battleshipService.depositStake(sessionId, soloAiAddress, soloAiSigner);
+                await new Promise((resolve) => setTimeout(resolve, START_STEP_DELAY_MS));
+              } catch (aiDepositErr) {
+                const msg = aiDepositErr instanceof Error ? aiDepositErr.message : 'AI stake deposit failed.';
+                if (!msg.includes('AlreadyDeposited')) {
+                  setError(msg);
+                  return;
+                }
+              }
+            }
           }
 
           await new Promise((resolve) => setTimeout(resolve, START_STEP_DELAY_MS));
@@ -1316,6 +1475,103 @@ export function BattleshipGame() {
           );
         }
 
+        if (mode === 'solo' && soloAiAddress && soloAiSigner) {
+          const latest = await refreshOnChainGame(publicKey);
+          const aiAlreadyCommitted = latest
+            ? (latest.player1 === soloAiAddress
+              ? typeof optionValue<Array<Buffer>>(latest.player1_board) !== 'undefined'
+              : typeof optionValue<Array<Buffer>>(latest.player2_board) !== 'undefined')
+            : false;
+
+          if (!aiAlreadyCommitted) {
+            const aiFleet = randomizeFleet();
+            if (!aiFleet) {
+              setError('Could not randomize AI fleet. Try again.');
+              return;
+            }
+            setEnemyFleet(aiFleet);
+
+            const aiOccupied = Array.from({ length: CELL_COUNT }, () => false);
+            aiFleet.forEach((ship) => {
+              for (let offset = 0; offset < ship.size; offset += 1) {
+                const x = ship.x + (ship.axis === 'h' ? offset : 0);
+                const y = ship.y + (ship.axis === 'v' ? offset : 0);
+                aiOccupied[toBoardIndex(x, y)] = true;
+              }
+            });
+
+            const aiSecrets: LocalCellSecret[] = aiOccupied.map((isShip) => {
+              const salt = new Uint8Array(32);
+              crypto.getRandomValues(salt);
+              return {
+                salt: Buffer.from(salt),
+                isShip,
+              };
+            });
+            const aiCommitments = aiSecrets.map((cell) => {
+              const payload = new Uint8Array(33);
+              payload[0] = cell.isShip ? 1 : 0;
+              payload.set(cell.salt, 1);
+              return Buffer.from(keccak_256.arrayBuffer(payload));
+            });
+            const aiShipCells = aiOccupied.filter(Boolean).length;
+            const aiCommitmentRoot = computeCommitmentRoot(aiCommitments);
+            setAiBoardSecrets(aiSecrets);
+
+            if (zkVerifier) {
+              const aiZkBoard = await requestBoardZkProof({
+                sessionId,
+                shipCells: aiShipCells,
+                commitmentRootHex: aiCommitmentRoot.toString('hex'),
+              });
+              if (!aiZkBoard) {
+                setError('ZK verifier mode requires prover endpoint configuration (VITE_NOIR_PROVER_URL).');
+                return;
+              }
+
+              setChainStatus('Step 3/3: Submitting AI board commitment on-chain (zk)...');
+              await battleshipService.commitBoardZk(
+                sessionId,
+                soloAiAddress,
+                aiCommitments,
+                aiShipCells,
+                aiZkBoard.proof,
+                soloAiSigner,
+              );
+            } else {
+              const verifier = await battleshipService.getVerifier();
+              const verifierEnabled = Boolean(verifier && verifier.length > 0);
+              let boardProofHash: Buffer | undefined;
+              let boardProofSignature: Buffer | undefined;
+
+              if (verifierEnabled) {
+                const attestation = await requestBoardCommitmentAttestation({
+                  sessionId,
+                  shipCells: aiShipCells,
+                  commitmentRootHex: aiCommitmentRoot.toString('hex'),
+                });
+                if (!attestation) {
+                  setError('Verifier mode requires prover endpoint configuration (VITE_NOIR_PROVER_URL).');
+                  return;
+                }
+                boardProofHash = attestation.proofHash;
+                boardProofSignature = attestation.signature;
+              }
+
+              setChainStatus('Step 3/3: Submitting AI board commitment on-chain...');
+              await battleshipService.commitBoard(
+                sessionId,
+                soloAiAddress,
+                aiCommitments,
+                aiShipCells,
+                boardProofHash,
+                boardProofSignature,
+                soloAiSigner,
+              );
+            }
+          }
+        }
+
         setBoardCommitted(true);
         setScreen('battle');
         setSuccess('Board committed on-chain. Battle started.');
@@ -1365,7 +1621,7 @@ export function BattleshipGame() {
   async function fireAtEnemy(x: number, y: number) {
     const key = `${x},${y}`;
 
-    if (isOnChainMultiplayerMode()) {
+    if (isOnChainGameMode()) {
       if (!battleshipService || !publicKey) return;
       if (enemyShots.has(key)) return;
 
@@ -1501,6 +1757,107 @@ export function BattleshipGame() {
     setEnemyTargets(nextTargets);
   }
 
+  async function resolvePendingAttackAsSoloAiIfNeeded(game: ContractGame, aiAddress: string, aiSigner: LocalContractSigner) {
+    if (!battleshipService || !aiBoardSecrets) return;
+    const pendingDefender = optionValue<string>(game.pending_defender);
+    const pendingX = optionValue<number>(game.pending_x);
+    const pendingY = optionValue<number>(game.pending_y);
+    if (pendingDefender !== aiAddress || typeof pendingX !== 'number' || typeof pendingY !== 'number') return;
+
+    const index = toBoardIndex(pendingX, pendingY);
+    const secret = aiBoardSecrets[index];
+    if (!secret) {
+      setError('AI board secret not found for pending resolution.');
+      return;
+    }
+
+    const proofPayload = Buffer.concat([
+      Buffer.from([secret.isShip ? 1 : 0]),
+      secret.salt,
+      Buffer.from(toU32Bytes(pendingX)),
+      Buffer.from(toU32Bytes(pendingY)),
+    ]);
+    const zkProofHash = Buffer.from(keccak_256.arrayBuffer(proofPayload));
+    const expectedCommitment = Buffer.from(keccak_256.arrayBuffer(Buffer.concat([
+      Buffer.from([secret.isShip ? 1 : 0]),
+      secret.salt,
+    ])));
+
+    const zkVerifierConfigured = await battleshipService.getZkVerifierContract();
+    const strictZkMode = Boolean(zkVerifierConfigured);
+
+    if (strictZkMode) {
+      const zk = await requestAttackZkProof({
+        sessionId,
+        x: pendingX,
+        y: pendingY,
+        isShip: secret.isShip,
+        proofHashHex: zkProofHash.toString('hex'),
+        expectedCommitmentHex: expectedCommitment.toString('hex'),
+      });
+      if (!zk) {
+        setError('ZK verifier is enabled but prover endpoint is not configured. Set VITE_NOIR_PROVER_URL.');
+        return;
+      }
+
+      await battleshipService.resolveAttackZk(sessionId, aiAddress, zk.proof, aiSigner);
+      return;
+    }
+
+    const verifier = await battleshipService.getVerifier();
+    const verifierEnabled = Boolean(verifier && verifier.length > 0);
+    let zkProofSignature: Buffer | undefined = undefined;
+
+    if (verifierEnabled) {
+      const attestation = await requestAttackResolutionAttestation({
+        sessionId,
+        x: pendingX,
+        y: pendingY,
+        isShip: secret.isShip,
+        proofHashHex: zkProofHash.toString('hex'),
+      });
+      if (!attestation) {
+        setError('Noir verifier is enabled but prover endpoint is not configured. Set VITE_NOIR_PROVER_URL.');
+        return;
+      }
+      zkProofSignature = attestation.signature;
+    }
+
+    await battleshipService.resolveAttack(
+      sessionId,
+      aiAddress,
+      secret.isShip,
+      secret.salt,
+      zkProofHash,
+      zkProofSignature,
+      aiSigner,
+    );
+  }
+
+  async function submitSoloAiAttackIfNeeded(game: ContractGame, aiAddress: string, aiSigner: LocalContractSigner) {
+    if (!battleshipService) return;
+
+    const turn = optionValue<string>(game.turn);
+    const pendingAttacker = optionValue<string>(game.pending_attacker);
+    if (turn !== aiAddress || typeof pendingAttacker === 'string') return;
+
+    const aiAttacks = (game.player1 === aiAddress ? game.player1_attacks : game.player2_attacks).map(Number);
+    const used = new Set(aiAttacks);
+
+    let chosenIndex = -1;
+    for (let attempt = 0; attempt < 250; attempt += 1) {
+      const candidate = Math.floor(Math.random() * CELL_COUNT);
+      if (!used.has(candidate)) {
+        chosenIndex = candidate;
+        break;
+      }
+    }
+    if (chosenIndex < 0) return;
+
+    const { x, y } = fromBoardIndex(chosenIndex);
+    await battleshipService.submitAttack(sessionId, aiAddress, x, y, aiSigner);
+  }
+
   const enemyMask = useMemo(() => {
     const mask = Array.from({ length: BOARD_SIZE }, () => Array(BOARD_SIZE).fill(false));
     enemyFleet.forEach((ship) => {
@@ -1516,23 +1873,23 @@ export function BattleshipGame() {
   }, [enemyFleet]);
 
   const meIsPlayer1 = Boolean(publicKey && onChainGame && onChainGame.player1 === publicKey);
-  const enemyShipCells = isOnChainMultiplayerMode()
+  const enemyShipCells = isOnChainGameMode()
     ? meIsPlayer1
       ? Number(optionValue<number>(onChainGame?.player2_ship_cells) || 0)
       : Number(optionValue<number>(onChainGame?.player1_ship_cells) || 0)
     : enemyFleet.reduce((acc, s) => acc + s.size, 0);
   const enemyHitsCount = enemyHits.size;
-  const playerShipCells = isOnChainMultiplayerMode()
+  const playerShipCells = isOnChainGameMode()
     ? meIsPlayer1
       ? Number(optionValue<number>(onChainGame?.player1_ship_cells) || 0)
       : Number(optionValue<number>(onChainGame?.player2_ship_cells) || 0)
     : playerFleetPlaced.reduce((acc, s) => acc + s.size, 0);
   const playerHitsCount = hitsPlayer.size;
   const onChainWinner = optionValue<string>(onChainGame?.winner);
-  const playerDefeated = isOnChainMultiplayerMode()
+  const playerDefeated = isOnChainGameMode()
     ? Boolean(onChainWinner && publicKey && onChainWinner !== publicKey)
     : playerHitsCount >= playerShipCells && playerShipCells > 0;
-  const enemyDefeated = isOnChainMultiplayerMode()
+  const enemyDefeated = isOnChainGameMode()
     ? Boolean(onChainWinner && publicKey && onChainWinner === publicKey)
     : enemyHitsCount >= enemyShipCells && enemyShipCells > 0;
   const themeClass = `theme-${theme}`;
@@ -1548,14 +1905,14 @@ export function BattleshipGame() {
   const onChainPayoutProcessed = Boolean(onChainGame?.payout_processed);
   const onChainPotStroops = toBigIntSafe(onChainGame?.player1_points) + toBigIntSafe(onChainGame?.player2_points);
   const onChainRewardWinner = Boolean(
-    isOnChainMultiplayerMode()
+    isOnChainGameMode()
     && matchType === 'wager'
     && publicKey
     && onChainWinner
     && onChainWinner === publicKey,
   );
   const myPendingAttackKey =
-    isOnChainMultiplayerMode()
+    isOnChainGameMode()
     && publicKey
     && onChainPendingAttacker === publicKey
     && typeof onChainPendingX === 'number'
@@ -1565,7 +1922,7 @@ export function BattleshipGame() {
 
   useEffect(() => {
     if (screen !== 'battle') return;
-    if (!isOnChainMultiplayerMode()) return;
+    if (!isOnChainGameMode()) return;
     if (!battleshipService || !publicKey) return;
 
     let cancelled = false;
@@ -1594,6 +1951,25 @@ export function BattleshipGame() {
               }
             } finally {
               autoResolveInFlightRef.current = false;
+            }
+          }
+        } else if (mode === 'solo') {
+          const aiSecret = getSoloAiSecret();
+          const aiAddress = getSoloAiAddress();
+          if (aiSecret && aiAddress && !aiActionInFlightRef.current) {
+            aiActionInFlightRef.current = true;
+            try {
+              const aiSigner = createLocalSignerFromSecret(aiSecret);
+              if (pendingDefender === aiAddress && typeof pendingX === 'number' && typeof pendingY === 'number') {
+                setChainStatus(`AI resolving your attack at (${pendingX}, ${pendingY})...`);
+                await resolvePendingAttackAsSoloAiIfNeeded(game, aiAddress, aiSigner);
+                if (!cancelled) await refreshOnChainGame(publicKey);
+              } else {
+                await submitSoloAiAttackIfNeeded(game, aiAddress, aiSigner);
+                if (!cancelled) await refreshOnChainGame(publicKey);
+              }
+            } finally {
+              aiActionInFlightRef.current = false;
             }
           }
         } else if (pendingDefender && pendingDefender !== publicKey) {
@@ -1625,7 +2001,7 @@ export function BattleshipGame() {
   }, [onChainRewardWinner, screen]);
 
   useEffect(() => {
-    if (!onChainEnabled || mode === 'solo' || !battleshipService) {
+    if (!onChainEnabled || !battleshipService) {
       setZkVerifierContract(undefined);
       setBetTokenContract(undefined);
       return;
@@ -1688,6 +2064,7 @@ export function BattleshipGame() {
       setShips(saved.ships);
       setBoardCommitted(saved.boardCommitted);
       setBoardSecrets(deserializeBoardSecrets(saved.boardSecrets));
+      setAiBoardSecrets(deserializeBoardSecrets(saved.aiBoardSecrets));
 
       if (saved.sessionSignerSecret) {
         try {
@@ -1713,7 +2090,6 @@ export function BattleshipGame() {
     if (!publicKey || !config.battleshipId) return;
 
     const shouldPersist = onChainEnabled
-      && mode !== 'solo'
       && (screen === 'setup' || screen === 'placement' || screen === 'battle');
 
     if (!shouldPersist) {
@@ -1740,6 +2116,7 @@ export function BattleshipGame() {
       ships,
       boardCommitted,
       boardSecrets: serializeBoardSecrets(boardSecrets),
+      aiBoardSecrets: serializeBoardSecrets(aiBoardSecrets),
       sessionSignerSecret: sessionSigner?.secret || null,
     };
 
@@ -1761,6 +2138,7 @@ export function BattleshipGame() {
     ships,
     boardCommitted,
     boardSecrets,
+    aiBoardSecrets,
     sessionSigner,
   ]);
 
@@ -1845,7 +2223,7 @@ export function BattleshipGame() {
 
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const includeSessionInPath = onChainEnabled && mode !== 'solo' && (screen === 'placement' || screen === 'battle');
+    const includeSessionInPath = onChainEnabled && (screen === 'placement' || screen === 'battle');
     const nextHash = hashForScreen(screen, sessionId, includeSessionInPath);
     if (window.location.hash !== nextHash) {
       window.history.replaceState(null, '', nextHash);
@@ -1860,7 +2238,7 @@ export function BattleshipGame() {
 
   useEffect(() => {
     if (screen !== 'placement' && screen !== 'battle') return;
-    if (!onChainEnabled || mode === 'solo') return;
+    if (!onChainEnabled) return;
     if (!battleshipService) return;
     if (!publicKey) {
       setError('Connect wallet to access this game endpoint.');
@@ -2003,7 +2381,7 @@ export function BattleshipGame() {
                     onChange={(e) => {
                       const nextMode = e.target.value as Mode;
                       setMode(nextMode);
-                      setOnChainEnabled(nextMode !== 'solo');
+                      setOnChainEnabled(true);
                     }}
                   >
                     <option value="solo">Solo vs AI</option>
@@ -2026,7 +2404,7 @@ export function BattleshipGame() {
                     disabled={joinFromInvite}
                     onChange={(e) => {
                       const nextMatchType = e.target.value as MatchType;
-                      if (nextMatchType === 'wager' && mode !== 'solo' && onChainEnabled && !betTokenContract) {
+                      if (nextMatchType === 'wager' && onChainEnabled && !betTokenContract) {
                         setError('Wager is not available yet because XLM staking is not configured on-chain.');
                         setMatchType('free');
                         return;
@@ -2035,9 +2413,9 @@ export function BattleshipGame() {
                     }}
                   >
                     <option value="free">Free play</option>
-                    <option value="wager" disabled={mode !== 'solo' && onChainEnabled && !betTokenContract}>Wager match</option>
+                    <option value="wager" disabled={onChainEnabled && !betTokenContract}>Wager match</option>
                   </select>
-                  {mode !== 'solo' && onChainEnabled && !betTokenContract && (
+                  {onChainEnabled && !betTokenContract && (
                     <div className="inline-hint">Wager disabled: admin must configure native XLM staking on-chain (`prover:set-bet-token`).</div>
                   )}
                 </div>
@@ -2324,7 +2702,7 @@ export function BattleshipGame() {
 
               <div className="placement_instructions" style={{ gap: 10 }}>
                 <div className="inline-hint">Placed ships: {ships.filter((s) => s.x !== null).length} / {ships.length}</div>
-                {isOnChainMultiplayerMode() && (
+                {isOnChainGameMode() && (
                   <div className="inline-hint">
                     {boardCommitted
                       ? 'Board committed on-chain.'
@@ -2334,7 +2712,7 @@ export function BattleshipGame() {
                   </div>
                 )}
                 <button disabled={!allPlaced() || isSyncingChain} onClick={startBattle} className="btn-primary btn-start">
-                  {isOnChainMultiplayerMode()
+                  {isOnChainGameMode()
                     ? (isSyncingChain
                       ? 'Syncing chain...'
                       : matchType === 'wager'
@@ -2383,8 +2761,8 @@ export function BattleshipGame() {
           <span>Session: {sessionId}</span>
           <span>Difficulty: {difficulty}</span>
           <span>Rule: {matchType === 'wager' ? `Wager (${totalStake.toFixed(2)} XLM)` : 'Free play'}</span>
-          {isOnChainMultiplayerMode() && <span>Settlement: On-chain</span>}
-          {isOnChainMultiplayerMode() && matchType === 'wager' && <span>Payout: {onChainPayoutProcessed ? 'Processed' : 'Pending'}</span>}
+          {isOnChainGameMode() && <span>Settlement: On-chain</span>}
+          {isOnChainGameMode() && matchType === 'wager' && <span>Payout: {onChainPayoutProcessed ? 'Processed' : 'Pending'}</span>}
           <span>Fleet Ready: {ships.filter((s) => s.x !== null).length}/{ships.length}</span>
           <span>Hits taken: {hitsPlayer.size}</span>
         </div>
@@ -2393,9 +2771,9 @@ export function BattleshipGame() {
           <div className="notice success">{lastRewardClaimText}</div>
         )}
 
-        {isOnChainMultiplayerMode() && chainStatus && <div className="notice success">{chainStatus}</div>}
+        {isOnChainGameMode() && chainStatus && <div className="notice success">{chainStatus}</div>}
 
-        {isOnChainMultiplayerMode() && publicKey && (
+        {isOnChainGameMode() && publicKey && (
           <div className="card" style={{ display: 'grid', gap: 10 }}>
             <div className="inline-hint">
               {sessionSigner
@@ -2422,7 +2800,7 @@ export function BattleshipGame() {
                 ? 'You successfully discovered and destroyed all enemy ships.'
                 : 'Your fleet has been fully destroyed. Reconfigure and try again.'}
             </p>
-            {isOnChainMultiplayerMode() && matchType === 'wager' && (
+            {isOnChainGameMode() && matchType === 'wager' && (
               <p className="inline-hint">Wager pot: {formatXlmFromStroops(onChainPotStroops)} XLM</p>
             )}
             <div className="result-actions">
@@ -2489,7 +2867,7 @@ export function BattleshipGame() {
                     onClick={async () => {
                       if (enemyDefeated || playerDefeated) return;
                       await fireAtEnemy(x, y);
-                      if (!isOnChainMultiplayerMode()) {
+                      if (!isOnChainGameMode()) {
                         enemyFires();
                       }
                     }}
