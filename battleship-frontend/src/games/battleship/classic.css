@@ -88,14 +88,16 @@
   margin: 0;
   color: var(--classic-accent);
   font-family: "IBM Plex Mono", monospace;
-  font-size: 0.62rem;
+  font-size: 0.68rem;
   line-height: 1.2;
   white-space: pre;
   overflow-x: auto;
+  text-align: center;
+  text-shadow: 0 0 12px rgba(10, 255, 76, 0.22);
 }
 
 .hero-subtitle {
-  margin-top: 8px;
+  margin-top: 10px;
   color: var(--classic-muted);
   font-size: 1rem;
 }
@@ -240,6 +242,39 @@
 .alert.error {
   color: #ff8080;
   border-color: rgba(255, 128, 128, 0.5);
+}
+
+.auto-join-card {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(0, 215, 222, 0.35);
+  background: linear-gradient(160deg, rgba(10, 22, 34, 0.92), rgba(8, 16, 26, 0.9));
+}
+
+.auto-join-title {
+  font-family: "IBM Plex Mono", monospace;
+  color: var(--classic-accent);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  font-size: 0.9rem;
+}
+
+.auto-join-loader {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--classic-text);
+  font-size: 0.9rem;
+}
+
+.auto-join-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--classic-accent-2);
+  box-shadow: 0 0 10px rgba(45, 252, 74, 0.45);
+  animation: pulse 1.2s ease-in-out infinite;
 }
 
 .setup-header {
@@ -548,6 +583,17 @@
   border-radius: 50%;
   background: rgba(220, 232, 244, 0.88);
   box-shadow: 0 0 10px rgba(220, 232, 244, 0.55);
+}
+
+.board_box.pending {
+  background: rgba(253, 218, 36, 0.16);
+  border-color: rgba(253, 218, 36, 0.85);
+  box-shadow: inset 0 0 0 1px rgba(253, 218, 36, 0.35), 0 0 10px rgba(253, 218, 36, 0.25);
+}
+
+.board_box.pending .board_box-marker {
+  color: rgba(253, 218, 36, 0.95);
+  font-size: 1.1rem;
 }
 
 .board_box-marker {
