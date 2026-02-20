@@ -119,7 +119,7 @@ pub enum ConfigKey { BetToken, FeeRecipient, FeeBps }
 const GAME_TTL_LEDGERS: u32 = 518_400;
 const DEFAULT_BOARD_SIZE: u32 = 10;
 const DEFAULT_SHIP_CELLS: u32 = 17;
-const DEFAULT_FEE_BPS: u32 = 500;
+const DEFAULT_FEE_BPS: u32 = 0;
 const BPS_DENOMINATOR: i128 = 10_000;
 const MAX_SESSION_TTL_LEDGERS: u32 = 172_800;
 const SESSION_GRANT_TTL_LEDGERS: u32 = 172_800;
