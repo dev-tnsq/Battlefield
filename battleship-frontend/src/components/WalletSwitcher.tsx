@@ -10,8 +10,15 @@ export function WalletSwitcher() {
     walletType,
     error,
     connectWallet,
+    connectDev,
+    switchPlayer,
     disconnect,
+    isDevModeAvailable,
+    getCurrentDevPlayer,
   } = useWallet();
+
+  const devModeAvailable = isDevModeAvailable();
+  const currentDevPlayer = getCurrentDevPlayer();
 
   const walletLabel = useMemo(() => {
     return walletType === 'dev' ? 'Dev wallet connected' : 'Wallet connected';
@@ -24,6 +31,16 @@ export function WalletSwitcher() {
           <button className="switch-button" onClick={() => connectWallet()} disabled={isConnecting}>
             Connect Wallet
           </button>
+          {devModeAvailable && (
+            <>
+              <button className="switch-button ghost" onClick={() => connectDev(1)} disabled={isConnecting}>
+                Use Player 1
+              </button>
+              <button className="switch-button ghost" onClick={() => connectDev(2)} disabled={isConnecting}>
+                Use Player 2
+              </button>
+            </>
+          )}
         </div>
         {error ? (
           <div className="wallet-error">
@@ -58,6 +75,42 @@ export function WalletSwitcher() {
             </div>
           </div>
           <div className="wallet-controls">
+            {devModeAvailable && walletType === 'wallet' && (
+              <>
+                <button
+                  onClick={() => connectDev(1)}
+                  className="switch-button ghost"
+                  disabled={isConnecting}
+                >
+                  Use Player 1
+                </button>
+                <button
+                  onClick={() => connectDev(2)}
+                  className="switch-button ghost"
+                  disabled={isConnecting}
+                >
+                  Use Player 2
+                </button>
+              </>
+            )}
+            {walletType === 'dev' && (
+              <>
+                <button
+                  onClick={() => switchPlayer(1)}
+                  className="switch-button ghost"
+                  disabled={isConnecting || currentDevPlayer === 1}
+                >
+                  Player 1
+                </button>
+                <button
+                  onClick={() => switchPlayer(2)}
+                  className="switch-button ghost"
+                  disabled={isConnecting || currentDevPlayer === 2}
+                >
+                  Player 2
+                </button>
+              </>
+            )}
             {walletType === 'wallet' && (
               <button
                 onClick={() => connectWallet()}
