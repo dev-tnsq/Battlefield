@@ -48,3 +48,5 @@ if (frontendCode !== 0) {
   console.error(`zk:up failed: frontend exited with code ${frontendCode}`);
   process.exit(frontendCode ?? 1);
 }
+
+export {};

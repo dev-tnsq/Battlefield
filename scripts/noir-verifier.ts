@@ -1,12 +1,16 @@
 #!/usr/bin/env bun
 
 import { Buffer } from 'buffer';
-import { Keypair, TransactionBuilder, hash } from '@stellar/stellar-sdk';
+import { Asset, Keypair, Networks, TransactionBuilder, hash } from '@stellar/stellar-sdk';
 import { Client as BattleshipClient } from '../bindings/battleship/src/index';
 import { readEnvFile, getEnvValue } from './utils/env';
 
 const RPC_URL = 'https://soroban-testnet.stellar.org';
 const NETWORK_PASSPHRASE = 'Test SDF Network ; September 2015';
+
+function getNativeXlmTokenContractId() {
+  return Asset.native().contractId(NETWORK_PASSPHRASE);
+}
 
 function usage() {
   console.log(`
@@ -19,6 +23,7 @@ Usage:
   bun run prover:set-bet-token   # set wager escrow token contract on battleship contract
   bun run prover:clear-bet-token # clear wager escrow token contract on battleship contract
   bun run prover:set-fee         # set protocol fee bps on battleship contract
+  bun run prover:status          # inspect current on-chain verifier/fee/bet-token config
 `);
 }
 
@@ -177,17 +182,11 @@ async function setBetToken(clear = false) {
     return;
   }
 
-  const betTokenContractId =
-    getEnvValue(env, 'BET_TOKEN_CONTRACT_ID') ||
-    getEnvValue(env, 'VITE_BET_TOKEN_CONTRACT_ID');
-
-  if (!betTokenContractId) {
-    throw new Error('BET_TOKEN_CONTRACT_ID (or VITE_BET_TOKEN_CONTRACT_ID) missing in .env');
-  }
+  const betTokenContractId = getNativeXlmTokenContractId();
 
   const tx = await client.set_bet_token({ token_contract: betTokenContractId });
   await tx.signAndSend();
-  console.log('✅ Bet token contract set on battleship contract');
+  console.log(`✅ Bet token contract set on battleship contract (native XLM): ${betTokenContractId}`);
 }
 
 async function setFeeBps() {
@@ -197,7 +196,7 @@ async function setFeeBps() {
     getEnvValue(env, 'VITE_DEV_ADMIN_SECRET') ||
     getEnvValue(env, 'VITE_DEV_PLAYER1_SECRET');
   const adminAddress = getEnvValue(env, 'VITE_DEV_ADMIN_ADDRESS');
-  const feeBpsRaw = getEnvValue(env, 'BATTLESHIP_FEE_BPS', '500');
+  const feeBpsRaw = process.env.BATTLESHIP_FEE_BPS || getEnvValue(env, 'BATTLESHIP_FEE_BPS', '0');
   const feeBps = Number(feeBpsRaw);
 
   if (!contractId) throw new Error('VITE_BATTLESHIP_CONTRACT_ID missing in .env');
@@ -219,6 +218,41 @@ async function setFeeBps() {
   const tx = await client.set_fee_bps({ fee_bps: feeBps });
   await tx.signAndSend();
   console.log(`✅ Fee bps set on battleship contract: ${feeBps}`);
+}
+
+async function status() {
+  const env = await readEnvFile('.env');
+  const contractId = getEnvValue(env, 'VITE_BATTLESHIP_CONTRACT_ID');
+
+  if (!contractId) {
+    throw new Error('VITE_BATTLESHIP_CONTRACT_ID missing in .env');
+  }
+
+  const client = new BattleshipClient({
+    contractId,
+    rpcUrl: RPC_URL,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  });
+
+  const [betToken, zkVerifier, feeBps] = await Promise.all([
+    (await client.get_bet_token()).simulate(),
+    (await client.get_zk_verifier()).simulate(),
+    (await client.get_fee_bps()).simulate(),
+  ]);
+  const nativeXlmTokenContract = getNativeXlmTokenContractId();
+
+  console.log('=== Battleship Contract Status ===');
+  console.log(`Contract: ${contractId}`);
+  console.log(`Bet token: ${betToken.result ?? 'NOT_CONFIGURED'}`);
+  console.log(`Expected native XLM token: ${nativeXlmTokenContract}`);
+  console.log(`Bet token is native XLM: ${betToken.result === nativeXlmTokenContract}`);
+  console.log(`ZK verifier: ${zkVerifier.result ?? 'NOT_CONFIGURED'}`);
+  console.log(`Fee bps: ${feeBps.result ?? 'DEFAULT(0)'}`);
+  console.log('');
+  console.log('=== Local Admin/Env Readiness ===');
+  console.log(`Has admin address: ${Boolean(getEnvValue(env, 'VITE_DEV_ADMIN_ADDRESS'))}`);
+  console.log(`Has admin secret: ${Boolean(getEnvValue(env, 'VITE_DEV_ADMIN_SECRET') || getEnvValue(env, 'VITE_DEV_PLAYER1_SECRET'))}`);
+  console.log('XLM-only mode: set-bet-token ignores BET_TOKEN_CONTRACT_ID env vars and uses native XLM contract id');
 }
 
 const cmd = process.argv[2];
@@ -243,6 +277,8 @@ if (cmd === 'init') {
   await setBetToken(true);
 } else if (cmd === 'set-fee') {
   await setFeeBps();
+} else if (cmd === 'status') {
+  await status();
 } else {
   usage();
   process.exit(1);

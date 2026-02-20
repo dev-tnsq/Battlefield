@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useMemo } from 'react';
 import { useWallet } from '../hooks/useWallet';
 import './WalletSwitcher.css';
 
@@ -10,36 +10,12 @@ export function WalletSwitcher() {
     walletType,
     error,
     connectWallet,
-    connectDev,
-    switchPlayer,
     disconnect,
-    getCurrentDevPlayer,
-    isDevModeAvailable,
   } = useWallet();
 
-  const currentPlayer = getCurrentDevPlayer();
-  const hasAttemptedConnection = useRef(false);
-
-  // Auto-connect behavior: prefer real wallet reconnect if available, fallback to dev mode.
-  useEffect(() => {
-    if (!isConnected && !isConnecting && !hasAttemptedConnection.current) {
-      hasAttemptedConnection.current = true;
-      if (isDevModeAvailable()) {
-        connectDev(1).catch(console.error);
-      }
-    }
-  }, [isConnected, isConnecting, connectDev, isDevModeAvailable]);
-
-  const handleSwitch = async () => {
-    if (walletType !== 'dev') return;
-
-    const nextPlayer = currentPlayer === 1 ? 2 : 1;
-    try {
-      await switchPlayer(nextPlayer);
-    } catch (err) {
-      console.error('Failed to switch player:', err);
-    }
-  };
+  const walletLabel = useMemo(() => {
+    return walletType === 'dev' ? 'Dev wallet connected' : 'Wallet connected';
+  }, [walletType]);
 
   if (!isConnected) {
     return (
@@ -48,11 +24,6 @@ export function WalletSwitcher() {
           <button className="switch-button" onClick={() => connectWallet()} disabled={isConnecting}>
             Connect Wallet
           </button>
-          {isDevModeAvailable() && (
-            <button className="switch-button ghost" onClick={() => connectDev(1)} disabled={isConnecting}>
-              Dev P1
-            </button>
-          )}
         </div>
         {error ? (
           <div className="wallet-error">
@@ -60,9 +31,9 @@ export function WalletSwitcher() {
             <div className="error-message">{error}</div>
           </div>
         ) : (
-          <div className="wallet-status connecting">
+          <div className={`wallet-status ${isConnecting ? 'connecting' : 'idle'}`}>
             <span className="status-indicator"></span>
-            <span className="status-text">Connecting...</span>
+            <span className="status-text">{isConnecting ? 'Connecting wallet...' : 'Wallet not connected yet'}</span>
           </div>
         )}
       </div>
@@ -81,34 +52,25 @@ export function WalletSwitcher() {
         <div className="wallet-status connected">
           <span className="status-indicator"></span>
           <div className="wallet-details">
-            <div className="wallet-label">
-              {walletType === 'dev' ? `Connected Player ${currentPlayer}` : 'Connected Wallet'}
-            </div>
+            <div className="wallet-label">{walletLabel}</div>
             <div className="wallet-address">
               {publicKey ? `${publicKey.slice(0, 8)}...${publicKey.slice(-4)}` : ''}
             </div>
           </div>
-          {walletType === 'wallet' && (
-            <button
-              onClick={() => connectWallet()}
-              className="switch-button ghost"
-              disabled={isConnecting}
-            >
-              Change Wallet
+          <div className="wallet-controls">
+            {walletType === 'wallet' && (
+              <button
+                onClick={() => connectWallet()}
+                className="switch-button ghost"
+                disabled={isConnecting}
+              >
+                Change Wallet
+              </button>
+            )}
+            <button onClick={() => disconnect()} className="switch-button ghost" disabled={isConnecting}>
+              Disconnect
             </button>
-          )}
-          {walletType === 'dev' && (
-            <button
-              onClick={handleSwitch}
-              className="switch-button"
-              disabled={isConnecting}
-            >
-              Switch to Player {currentPlayer === 1 ? 2 : 1}
-            </button>
-          )}
-          <button onClick={() => disconnect()} className="switch-button ghost" disabled={isConnecting}>
-            Disconnect
-          </button>
+          </div>
         </div>
       </div>
     </div>
