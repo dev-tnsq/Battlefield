@@ -637,26 +637,27 @@ export function BattleshipGame() {
       return;
     }
 
-    if (!sessionSigner) {
-      setError('Enable One-Tap Signing to resolve in-game attacks without wallet popups.');
-      return;
-    }
+    const usingDelegation = Boolean(sessionSigner);
+    let actionSigner = getContractSigner();
+    let delegateAddress: string | undefined;
 
-    const sessionGrant = await battleshipService.getSession(sessionId, myAddress, sessionSigner.publicKey);
-    console.info('[one-tap] Pre-resolve session grant check', {
-      sessionId,
-      defender: shortAddress(myAddress),
-      delegate: shortAddress(sessionSigner.publicKey),
-      grant: sessionGrant,
-    });
-    if (!sessionGrant) {
-      setSessionSigner(null);
-      setError('One-Tap Signing grant not found on-chain. Please enable One-Tap Signing again.');
-      setChainStatus('One-tap signing is off.');
-      return;
+    if (sessionSigner) {
+      const sessionGrant = await battleshipService.getSession(sessionId, myAddress, sessionSigner.publicKey);
+      console.info('[one-tap] Pre-resolve session grant check', {
+        sessionId,
+        defender: shortAddress(myAddress),
+        delegate: shortAddress(sessionSigner.publicKey),
+        grant: sessionGrant,
+      });
+      if (!sessionGrant) {
+        setSessionSigner(null);
+        setChainStatus('One-tap signing is off. Falling back to wallet signing.');
+      } else {
+        await ensureSessionSignerAccountReady(sessionSigner.publicKey);
+        actionSigner = sessionSigner.signer;
+        delegateAddress = sessionSigner.publicKey;
+      }
     }
-
-    await ensureSessionSignerAccountReady(sessionSigner.publicKey);
 
     const proofPayload = Buffer.concat([
       Buffer.from([secret.isShip ? 1 : 0]),
@@ -689,20 +690,20 @@ export function BattleshipGame() {
 
       try {
         setIsSyncingChain(true);
-        setChainStatus('Resolving incoming attack on-chain (zk)...');
+        setChainStatus(usingDelegation ? 'Resolving incoming attack on-chain (zk)...' : 'Resolving incoming attack on-chain (wallet confirm)...');
         await battleshipService.resolveAttackZk(
           sessionId,
           myAddress,
           zk.proof,
-          sessionSigner.signer,
-          sessionSigner.publicKey,
+          actionSigner,
+          delegateAddress,
         );
         setChainStatus('Incoming attack resolved.');
       } catch (err) {
         if (isNoPendingAttackError(err)) {
           setError(null);
           setChainStatus('Incoming attack was already resolved on-chain.');
-        } else if (isSessionSignerAuthFailure(err)) {
+        } else if (usingDelegation && isSessionSignerAuthFailure(err)) {
           setSessionSigner(null);
           setError('Delegated signer authentication failed. One-Tap Signing was disabled; enable it again to continue without wallet popups.');
           setChainStatus('One-tap signing is off.');
@@ -736,7 +737,7 @@ export function BattleshipGame() {
 
     try {
       setIsSyncingChain(true);
-      setChainStatus('Resolving incoming attack on-chain...');
+      setChainStatus(usingDelegation ? 'Resolving incoming attack on-chain...' : 'Resolving incoming attack on-chain (wallet confirm)...');
       await battleshipService.resolveAttack(
         sessionId,
         myAddress,
@@ -744,15 +745,15 @@ export function BattleshipGame() {
         secret.salt,
         zkProofHash,
         zkProofSignature,
-        sessionSigner.signer,
-        sessionSigner.publicKey,
+        actionSigner,
+        delegateAddress,
       );
       setChainStatus('Incoming attack resolved.');
     } catch (err) {
       if (isNoPendingAttackError(err)) {
         setError(null);
         setChainStatus('Incoming attack was already resolved on-chain.');
-      } else if (isSessionSignerAuthFailure(err)) {
+      } else if (usingDelegation && isSessionSignerAuthFailure(err)) {
         setSessionSigner(null);
         setError('Delegated signer authentication failed. One-Tap Signing was disabled; enable it again to continue without wallet popups.');
         setChainStatus('One-tap signing is off.');
@@ -1646,44 +1647,45 @@ export function BattleshipGame() {
         return;
       }
 
-      if (!sessionSigner) {
-        setError('Enable One-Tap Signing before firing to avoid wallet popup on every turn.');
-        return;
-      }
+      const usingDelegation = Boolean(sessionSigner);
+      let actionSigner = getContractSigner();
+      let delegateAddress: string | undefined;
 
-      const sessionGrant = await battleshipService.getSession(sessionId, publicKey, sessionSigner.publicKey);
-      console.info('[one-tap] Pre-attack session grant check', {
-        sessionId,
-        attacker: shortAddress(publicKey),
-        delegate: shortAddress(sessionSigner.publicKey),
-        grant: sessionGrant,
-      });
-      if (!sessionGrant) {
-        setSessionSigner(null);
-        setError('One-Tap Signing grant not found on-chain. Please enable One-Tap Signing again.');
-        setChainStatus('One-tap signing is off.');
-        return;
+      if (sessionSigner) {
+        const sessionGrant = await battleshipService.getSession(sessionId, publicKey, sessionSigner.publicKey);
+        console.info('[one-tap] Pre-attack session grant check', {
+          sessionId,
+          attacker: shortAddress(publicKey),
+          delegate: shortAddress(sessionSigner.publicKey),
+          grant: sessionGrant,
+        });
+        if (!sessionGrant) {
+          setSessionSigner(null);
+          setChainStatus('One-tap signing is off. Falling back to wallet signing.');
+        } else {
+          await ensureSessionSignerAccountReady(sessionSigner.publicKey);
+          actionSigner = sessionSigner.signer;
+          delegateAddress = sessionSigner.publicKey;
+        }
       }
-
-      await ensureSessionSignerAccountReady(sessionSigner.publicKey);
 
       try {
         setIsSyncingChain(true);
-        setChainStatus('Submitting attack on-chain...');
+        setChainStatus(usingDelegation ? 'Submitting attack on-chain...' : 'Submitting attack on-chain (wallet confirm)...');
         await battleshipService.submitAttack(
           sessionId,
           publicKey,
           x,
           y,
-          sessionSigner.signer,
-          sessionSigner.publicKey,
+          actionSigner,
+          delegateAddress,
         );
         setError(null);
         setSuccess('Attack submitted on-chain. Waiting for resolution.');
         setChainStatus(`Attack submitted at (${x}, ${y}). Waiting for defender resolution...`);
         await refreshOnChainGame(publicKey);
       } catch (err) {
-        if (isSessionSignerAuthFailure(err)) {
+        if (usingDelegation && isSessionSignerAuthFailure(err)) {
           setSessionSigner(null);
           setError('Delegated signer authentication failed. One-Tap Signing was disabled; enable it again and retry your move.');
           setChainStatus('One-tap signing is off.');
@@ -2252,15 +2254,20 @@ export function BattleshipGame() {
         const game = await battleshipService.getGame(sessionId);
         if (cancelled) return;
         if (!game) {
+          if (mode === 'invite' && screen === 'placement') {
+            setError(null);
+            setChainStatus('Invite host flow: waiting for invited player to join and create the on-chain session.');
+            return;
+          }
           setError('Invalid game endpoint. Session not found on-chain.');
-          setScreen('home');
+          setScreen('setup');
           return;
         }
 
         const isParticipant = game.player1 === publicKey || game.player2 === publicKey;
         if (!isParticipant) {
           setError('This game endpoint is signed for different players. Connect the invited wallet.');
-          setScreen('home');
+          setScreen('setup');
           return;
         }
       } catch {
